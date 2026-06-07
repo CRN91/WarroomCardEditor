@@ -57,6 +57,7 @@ except Exception:
 
 CARD_TYPES = ["intel", "event", "decision"]
 OP_PRESETS = ["add", "mul", "set"]
+STAT_PRESETS = ["move_block", "city_income", "attack"]
 POSITION_PRESETS = ["front", "soon", "random", "back"]
 SCOPE_PRESETS = [
     "all", "player", "enemy", "neutral", "ground", "combatant", "supplier",
@@ -66,13 +67,13 @@ SCOPE_PRESETS = [
 
 # A modifier sub-dict (used inline by add_modifier and inside set_weather).
 MODIFIER_FIELDS = [
-    ("id", "text", None),
-    ("stat", "text", None),
+    ("id", "text", "blank = auto-generated"),
+    ("stat", "stat", None),
     ("op", "op", None),
     ("value", "num", None),
     ("scope", "scope", None),
-    ("duration_days", "int", None),
-    ("source", "text", None),
+    ("duration_days", "int", "blank = permanent"),
+    ("source", "text", "optional, your reference"),
     ("tags", "list_str", None),
 ]
 
@@ -83,13 +84,13 @@ EFFECT_SCHEMA = {
         ("modifiers", "modifier_list", None),
     ],
     "add_modifier": [
-        ("id", "text", None),
-        ("stat", "text", None),
+        ("id", "text", "blank = auto-generated"),
+        ("stat", "stat", None),
         ("op", "op", None),
         ("value", "num", None),
         ("scope", "scope", None),
-        ("duration_days", "int", None),
-        ("source", "text", None),
+        ("duration_days", "int", "blank = permanent"),
+        ("source", "text", "optional"),
         ("tags", "list_str", None),
     ],
     "remove_modifier": [("id", "text", None)],
@@ -110,14 +111,27 @@ EFFECT_SCHEMA = {
         ("effect", "effect", None),
     ],
     "spawn_unit": [
-        ("unit_type", "text", None),
+        ("unit", "choice", ["infantry", "artillery", "logistics"]),
         ("team", "int", None),
         ("near", "text", None),
-        ("count", "int", None),
+        ("unit_type", "text", None),
+        ("fill", "bool", None),
+        ("max_resources", "int", None),
+        ("name", "text", None),
+        ("tags", "list_str", None),
+        ("modifiers", "modifier_list", None),
     ],
     "transform_unit": [
         ("scope", "scope", None),
-        ("to", "text", None),
+        ("count", "int", None),
+        ("combatants_only", "bool", None),
+        ("unit_type", "text", None),
+        ("rename", "text", None),
+        ("add_tags", "list_str", None),
+        ("max_resources", "int", None),
+        ("set_resources", "int", None),
+        ("replenish", "int", None),
+        ("modifiers", "modifier_list", None),
     ],
     "grant_resources": [
         ("scope", "scope", None),
@@ -159,6 +173,12 @@ def split_list(s):
     return [x.strip() for x in str(s).split(",") if x.strip()]
 
 
+def drop_empty(d):
+    """Strip blank/False/empty fields but KEEP an explicit 0 (uses identity for False)."""
+    return {k: v for k, v in d.items()
+            if not (v is None or v is False or v == "" or v == [] or v == {})}
+
+
 def effect_refs(effect):
     """Return (card_ids, set_ids, script_fns) a single effect points at."""
     cards, sets_, fns = [], [], []
@@ -188,6 +208,40 @@ def card_effect_lists(card):
         ch = card.get(ck)
         if isinstance(ch, dict) and isinstance(ch.get("effects"), list):
             yield ch["effects"]
+
+
+def card_link_edges(card):
+    """Return [(target_id, kind)] for every card->card link this card makes.
+    kind is 'inject_cards' / 'remove_cards' (solid) or 'delayed_card' (dashed)."""
+    out = []
+
+    def scan(eff):
+        t = eff.get("type")
+        if t in ("inject_cards", "remove_cards"):
+            out.extend((i, t) for i in eff.get("ids", []))
+        elif t == "delayed_card" and eff.get("id"):
+            out.append((eff["id"], "delayed_card"))
+        elif t == "delayed_effect":
+            scan(eff.get("effect", {}) or {})
+
+    for lst in card_effect_lists(card):
+        for eff in lst:
+            scan(eff)
+    return out
+
+
+def compute_layers(nodes, edges):
+    """Longest-path layering (left=roots). Bounded so cycles can't loop forever."""
+    layer = {n: 0 for n in nodes}
+    for _ in range(len(nodes)):
+        changed = False
+        for a, b, _kind in edges:
+            if a in layer and b in layer and layer[b] < layer[a] + 1:
+                layer[b] = layer[a] + 1
+                changed = True
+        if not changed:
+            break
+    return layer
 
 
 class Deck:
@@ -381,6 +435,31 @@ class Deck:
         return issues
 
 
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".card_forge.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+    except Exception:
+        pass
+
+
+def update_config(**kwargs):
+    cfg = load_config()
+    cfg.update(kwargs)
+    save_config(cfg)
+
+
 def parse_script_names(path):
     """Extract top-level func names from a card_scripts.gd file."""
     names = []
@@ -463,13 +542,17 @@ class FormBuilder:
         if kind in ("text",):
             var = tk.StringVar(value="" if value is None else str(value))
             ttk.Entry(parent, textvariable=var).grid(row=r, column=1, sticky="ew", padx=4, pady=3)
+            if isinstance(extra, str):
+                ttk.Label(parent, text=extra, foreground="#888").grid(row=r, column=2, sticky="w")
             return lambda: var.get()
         if kind in ("int", "num"):
             var = tk.StringVar(value="" if value is None else str(value))
             ttk.Entry(parent, textvariable=var, width=14).grid(row=r, column=1, sticky="w", padx=4, pady=3)
+            if isinstance(extra, str):
+                ttk.Label(parent, text=extra, foreground="#888").grid(row=r, column=2, sticky="w")
             if kind == "int":
-                return lambda: int(parse_num(var.get())) if str(var.get()).strip() else 0
-            return lambda: parse_num(var.get())
+                return lambda: (int(parse_num(var.get())) if str(var.get()).strip() else None)
+            return lambda: (parse_num(var.get()) if str(var.get()).strip() else None)
         if kind == "bool":
             var = tk.BooleanVar(value=bool(value))
             ttk.Checkbutton(parent, variable=var).grid(row=r, column=1, sticky="w", padx=4, pady=3)
@@ -479,7 +562,7 @@ class FormBuilder:
             cb = ttk.Combobox(parent, textvariable=var, values=extra or [], state="readonly")
             cb.grid(row=r, column=1, sticky="w", padx=4, pady=3)
             return lambda: var.get()
-        if kind in ("scope", "op", "card_ref", "set_ref", "script_ref"):
+        if kind in ("scope", "op", "stat", "card_ref", "set_ref", "script_ref"):
             return self._combo(parent, r, kind, value)
         if kind == "list_str":
             var = tk.StringVar(value=", ".join(value) if isinstance(value, list) else ("" if value is None else str(value)))
@@ -503,6 +586,8 @@ class FormBuilder:
         var = tk.StringVar(value="" if value is None else str(value))
         if kind == "scope":
             vals = SCOPE_PRESETS
+        elif kind == "stat":
+            vals = STAT_PRESETS
         elif kind == "op":
             vals = OP_PRESETS
         elif kind == "card_ref":
@@ -703,10 +788,7 @@ class ModifierDialog(ModalDialog):
         self.wait()
 
     def _ok(self):
-        d = self.form.read()
-        # drop empties so weather modifiers stay tidy
-        d = {k: v for k, v in d.items() if v not in ("", [], None)}
-        self.result = d
+        self.result = drop_empty(self.form.read())
         self.destroy()
 
 
@@ -761,8 +843,7 @@ class EffectDialog(ModalDialog):
                 obj["type"] = self.type_var.get()
             self.result = obj
         else:
-            d = self.form.read()
-            d = {k: v for k, v in d.items() if v not in ("", [], None)}
+            d = drop_empty(self.form.read())
             d["type"] = self.type_var.get()
             self.result = d
         self.destroy()
@@ -788,6 +869,22 @@ class App(tk.Tk):
         self._build_menu()
         self._build_layout()
 
+        # Restore remembered scripts/assets paths from the last session.
+        cfg = load_config()
+        sp = cfg.get("scripts_path")
+        if sp and os.path.exists(sp):
+            self.scripts_path = sp
+            self._scripts_cache = parse_script_names(sp)
+        ar = cfg.get("assets_root")
+        if ar and os.path.isdir(ar):
+            self.assets_root = ar
+
+        # Choose what to open: explicit arg wins, else the last deck if it still exists.
+        if not (start_path and os.path.exists(start_path)):
+            last = cfg.get("last_deck")
+            if last and os.path.exists(last):
+                start_path = last
+
         if start_path and os.path.exists(start_path):
             self._open(start_path)
         else:
@@ -812,7 +909,8 @@ class App(tk.Tk):
 
         toolm = tk.Menu(m, tearoff=0)
         toolm.add_command(label="Validate deck", command=self._validate)
-        toolm.add_command(label="Story map", command=self._story_map)
+        toolm.add_command(label="Story graph", command=self._story_graph)
+        toolm.add_command(label="Story map (text)", command=self._story_map)
         m.add_cascade(label="Tools", menu=toolm)
         self.config(menu=m)
         self.bind("<Control-s>", lambda e: self._save())
@@ -918,12 +1016,14 @@ class App(tk.Tk):
         if p:
             self.scripts_path = p
             self._scripts_cache = parse_script_names(p)
+            update_config(scripts_path=os.path.abspath(p))
             self._set_status(f"Linked {os.path.basename(p)} ({len(self._scripts_cache)} scripts).")
 
     def _set_assets_root(self):
         d = filedialog.askdirectory(title="Project folder that res:// points to")
         if d:
             self.assets_root = d
+            update_config(assets_root=os.path.abspath(d))
             self._set_status(f"Assets root: {d}")
 
     # ---- file ops ----
@@ -949,6 +1049,7 @@ class App(tk.Tk):
             return
         self.current_id = None
         self._refresh_tree()
+        update_config(last_deck=os.path.abspath(path))
         self._set_status(f"Opened {path}")
 
     def _save(self):
@@ -968,6 +1069,7 @@ class App(tk.Tk):
         if p:
             try:
                 self.deck.save(p)
+                update_config(last_deck=os.path.abspath(p))
                 self._set_status(f"Saved {p}")
             except Exception as ex:
                 messagebox.showerror("Save failed", str(ex))
@@ -1247,6 +1349,168 @@ class App(tk.Tk):
                 for m in warns:
                     txt.insert("end", f"  • {m}\n")
         txt.config(state="disabled")
+
+    def _story_graph(self):
+        self._commit_current()
+        typeof = {c.get("id"): c.get("type", "") for _, c in self.deck.iter_cards()}
+        edges = []
+        for _, c in self.deck.iter_cards():
+            src = c.get("id")
+            for tgt, kind in card_link_edges(c):
+                edges.append((src, tgt, kind))
+        nodes = sorted(set([a for a, _, _ in edges] + [b for _, b, _ in edges]))
+        if not nodes:
+            messagebox.showinfo("Story graph",
+                                "No linked cards yet.\nAdd an inject_cards or delayed_card effect to connect two cards.")
+            return
+
+        # group cards into weakly-connected components so separate storylines
+        # render as separate, clearly-labelled bands instead of one tangle.
+        adj_u = {n: set() for n in nodes}
+        for a, b, _k in edges:
+            adj_u[a].add(b); adj_u[b].add(a)
+        seen = set(); components = []
+        for n in nodes:
+            if n in seen:
+                continue
+            comp = []; stack = [n]; seen.add(n)
+            while stack:
+                x = stack.pop(); comp.append(x)
+                for y in adj_u[x]:
+                    if y not in seen:
+                        seen.add(y); stack.append(y)
+            components.append(sorted(comp))
+
+        NW, NH, COLW, ROWH = 168, 46, 240, 92
+        colors = {"intel": "#B5D4F4", "event": "#FAC775", "decision": "#CECBF6"}
+        pos = {}
+        comp_labels = []     # (y, text)
+        comp_seps = []       # y of a faint divider between bands
+        band_top = 70
+        BAND_GAP = 72
+        for ci, comp in enumerate(components):
+            cset = set(comp)
+            c_edges = [(a, b, k) for a, b, k in edges if a in cset and b in cset]
+            layer = compute_layers(comp, c_edges)
+            order = {}
+            for n in comp:
+                order.setdefault(layer[n], []).append(n)
+            for L in order:
+                order[L].sort()
+            Ls = sorted(order)
+            preds = {n: [] for n in comp}; succs = {n: [] for n in comp}
+            for a, b, _k in c_edges:
+                succs[a].append(b); preds[b].append(a)
+            for _sweep in range(4):   # barycenter ordering — pulls linked nodes inline
+                for L in Ls[1:]:
+                    pi = {x: i for i, x in enumerate(order[L - 1])}
+                    cur = {x: i for i, x in enumerate(order[L])}
+                    order[L].sort(key=lambda n: (sum(pi.get(p, 0) for p in preds[n]) / len(preds[n])) if preds[n] else cur[n])
+                for L in reversed(Ls[:-1]):
+                    si = {x: i for i, x in enumerate(order[L + 1])}
+                    cur = {x: i for i, x in enumerate(order[L])}
+                    order[L].sort(key=lambda n: (sum(si.get(s, 0) for s in succs[n]) / len(succs[n])) if succs[n] else cur[n])
+            max_rows = max((len(order[L]) for L in Ls), default=1)
+            if ci > 0:
+                comp_seps.append(band_top - BAND_GAP / 2)
+            comp_labels.append((band_top - 26, "pathway %d" % (ci + 1)))
+            for L in Ls:
+                ns = order[L]
+                off = (max_rows - len(ns)) / 2.0
+                for i, n in enumerate(ns):
+                    pos[n] = [40 + L * COLW, band_top + (i + off) * ROWH]
+            band_top += max_rows * ROWH + BAND_GAP
+        graph_w = max((p[0] for p in pos.values()), default=200) + NW + 60
+
+        win = tk.Toplevel(self)
+        win.title("Story graph — drag nodes · double-click to edit")
+        win.geometry("900x600")
+        canvas = tk.Canvas(win, background="white", highlightthickness=0)
+        hbar = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
+        vbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        win.rowconfigure(0, weight=1)
+        win.columnconfigure(0, weight=1)
+
+        # legend
+        canvas.create_line(20, 24, 52, 24, fill="#777", arrow="last")
+        canvas.create_text(58, 24, text="inject (now)", anchor="w", font=("TkDefaultFont", 8), fill="#444")
+        canvas.create_line(170, 24, 202, 24, fill="#777", arrow="last", dash=(4, 3))
+        canvas.create_text(208, 24, text="delayed (later)", anchor="w", font=("TkDefaultFont", 8), fill="#444")
+
+        def redraw_edges():
+            canvas.delete("edge")
+            for a, b, kind in edges:
+                if a not in pos or b not in pos:
+                    continue
+                ax, ay = pos[a]; bx, by = pos[b]
+                dash = (4, 3) if kind == "delayed_card" else ()
+                canvas.create_line(ax + NW, ay + NH / 2, bx, by + NH / 2,
+                                   arrow="last", fill="#777", dash=dash, tags=("edge",))
+            canvas.tag_lower("edge")
+
+        def draw_node(n):
+            x, y = pos[n]
+            tag = "n_" + n
+            canvas.create_rectangle(x, y, x + NW, y + NH, fill=colors.get(typeof.get(n, ""), "#D3D1C7"),
+                                    outline="#555", width=1, tags=(tag, "node"))
+            canvas.create_text(x + NW / 2, y + NH / 2 - 7, text=n, width=NW - 10,
+                               font=("TkDefaultFont", 8), fill="#1a1a1a", tags=(tag, "node"))
+            canvas.create_text(x + NW / 2, y + NH / 2 + 11, text=typeof.get(n, ""),
+                               font=("TkDefaultFont", 7), fill="#555", tags=(tag,))
+
+        for (ly, lt) in comp_labels:
+            canvas.create_text(12, ly, text=lt, anchor="w",
+                               font=("TkDefaultFont", 9, "bold"), fill="#999", tags=("sep",))
+        for sy in comp_seps:
+            canvas.create_line(8, sy, graph_w, sy, fill="#e2e2e2", dash=(2, 4), tags=("sep",))
+
+        for n in nodes:
+            draw_node(n)
+        redraw_edges()
+        canvas.tag_lower("sep")
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+        drag = {"n": None, "x": 0, "y": 0}
+
+        def node_at(e):
+            item = canvas.find_closest(canvas.canvasx(e.x), canvas.canvasy(e.y))
+            for t in canvas.gettags(item):
+                if t.startswith("n_"):
+                    return t[2:]
+            return None
+
+        def on_press(e):
+            drag["n"] = node_at(e)
+            drag["x"] = canvas.canvasx(e.x); drag["y"] = canvas.canvasy(e.y)
+
+        def on_motion(e):
+            if not drag["n"]:
+                return
+            cx, cy = canvas.canvasx(e.x), canvas.canvasy(e.y)
+            dx, dy = cx - drag["x"], cy - drag["y"]
+            canvas.move("n_" + drag["n"], dx, dy)
+            pos[drag["n"]][0] += dx; pos[drag["n"]][1] += dy
+            drag["x"], drag["y"] = cx, cy
+            redraw_edges()
+
+        def on_double(e):
+            n = node_at(e)
+            if n:
+                self._commit_current()
+                try:
+                    self.tree.selection_set("card:" + n); self.tree.see("card:" + n)
+                except Exception:
+                    pass
+                self._load_card(n)
+                self.lift()
+
+        canvas.bind("<Button-1>", on_press)
+        canvas.bind("<B1-Motion>", on_motion)
+        canvas.bind("<Double-Button-1>", on_double)
 
     def _story_map(self):
         self._commit_current()
