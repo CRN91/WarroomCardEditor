@@ -200,33 +200,42 @@ def effect_refs(effect):
     return cards, sets_, fns
 
 
-def card_effect_lists(card):
-    """Yield every effects list belonging to a card (top-level and per-choice)."""
+def card_effect_sources(card):
+    """Yield (choice_key, choice_label, effects_list). choice_key is "" for an
+    intel/event card's top-level effects. Handles any number of choice_* keys."""
     if isinstance(card.get("effects"), list):
-        yield card["effects"]
-    for ck in ("choice_a", "choice_b"):
+        yield ("", "", card["effects"])
+    for ck in sorted(k for k in card if k.startswith("choice_")):
         ch = card.get(ck)
         if isinstance(ch, dict) and isinstance(ch.get("effects"), list):
-            yield ch["effects"]
+            yield (ck, ch.get("label", ""), ch["effects"])
+
+
+def card_effect_lists(card):
+    """Every effects list belonging to a card (top-level and per-choice)."""
+    for _ck, _lbl, lst in card_effect_sources(card):
+        yield lst
 
 
 def card_link_edges(card):
-    """Return [(target_id, kind)] for every card->card link this card makes.
-    kind is 'inject_cards' / 'remove_cards' (solid) or 'delayed_card' (dashed)."""
+    """[(target_id, kind, choice_key, choice_label)] for every card->card link.
+    kind: 'inject_cards'/'remove_cards' (solid) or 'delayed_card' (dashed)."""
     out = []
 
-    def scan(eff):
+    def targets(eff):
         t = eff.get("type")
         if t in ("inject_cards", "remove_cards"):
-            out.extend((i, t) for i in eff.get("ids", []))
-        elif t == "delayed_card" and eff.get("id"):
-            out.append((eff["id"], "delayed_card"))
-        elif t == "delayed_effect":
-            scan(eff.get("effect", {}) or {})
+            return [(i, t) for i in eff.get("ids", [])]
+        if t == "delayed_card" and eff.get("id"):
+            return [(eff["id"], "delayed_card")]
+        if t == "delayed_effect":
+            return targets(eff.get("effect", {}) or {})
+        return []
 
-    for lst in card_effect_lists(card):
+    for ck, label, lst in card_effect_sources(card):
         for eff in lst:
-            scan(eff)
+            for tgt, kind in targets(eff):
+                out.append((tgt, kind, ck, label))
     return out
 
 
@@ -242,6 +251,62 @@ def compute_layers(nodes, edges):
         if not changed:
             break
     return layer
+
+
+def layout_components(nodes, edges, NW=168, COLW=240, ROWH=92, band_gap=72, top=70):
+    """Lay each weakly-connected storyline in its own band, left->right by depth,
+    with a barycenter pass to reduce arrow crossings. edges: (src, tgt, ...)."""
+    adj = {n: set() for n in nodes}
+    for e in edges:
+        a, b = e[0], e[1]
+        if a in adj and b in adj:
+            adj[a].add(b); adj[b].add(a)
+    seen = set(); comps = []
+    for n in sorted(nodes):
+        if n in seen:
+            continue
+        comp = []; st = [n]; seen.add(n)
+        while st:
+            x = st.pop(); comp.append(x)
+            for y in adj[x]:
+                if y not in seen:
+                    seen.add(y); st.append(y)
+        comps.append(sorted(comp))
+
+    pos = {}; labels = []; seps = []; band_top = top
+    for ci, comp in enumerate(comps):
+        cset = set(comp)
+        ce = [(e[0], e[1]) for e in edges if e[0] in cset and e[1] in cset]
+        layer = compute_layers(comp, [(a, b, None) for a, b in ce])
+        order = {}
+        for n in comp:
+            order.setdefault(layer[n], []).append(n)
+        for L in order:
+            order[L].sort()
+        Ls = sorted(order)
+        preds = {n: [] for n in comp}; succs = {n: [] for n in comp}
+        for a, b in ce:
+            succs[a].append(b); preds[b].append(a)
+        for _ in range(4):
+            for L in Ls[1:]:
+                pi = {x: i for i, x in enumerate(order[L - 1])}
+                cur = {x: i for i, x in enumerate(order[L])}
+                order[L].sort(key=lambda n: (sum(pi.get(p, 0) for p in preds[n]) / len(preds[n])) if preds[n] else cur[n])
+            for L in reversed(Ls[:-1]):
+                si = {x: i for i, x in enumerate(order[L + 1])}
+                cur = {x: i for i, x in enumerate(order[L])}
+                order[L].sort(key=lambda n: (sum(si.get(s, 0) for s in succs[n]) / len(succs[n])) if succs[n] else cur[n])
+        max_rows = max((len(order[L]) for L in Ls), default=1)
+        if ci > 0:
+            seps.append(band_top - band_gap / 2)
+        labels.append((band_top - 26, "pathway %d" % (ci + 1), comp[0]))
+        for L in Ls:
+            ns = order[L]; off = (max_rows - len(ns)) / 2.0
+            for i, n in enumerate(ns):
+                pos[n] = [40 + L * COLW, band_top + (i + off) * ROWH]
+        band_top += max_rows * ROWH + band_gap
+    graph_w = max((p[0] for p in pos.values()), default=200) + NW + 60
+    return pos, labels, seps, graph_w, comps
 
 
 class Deck:
@@ -1144,9 +1209,17 @@ class App(tk.Tk):
             w.destroy()
         self._choice_vars = {}
         if card.get("type") == "decision":
-            for ck, title in (("choice_a", "Choice A"), ("choice_b", "Choice B")):
+            ctrl = ttk.Frame(self.body); ctrl.pack(fill="x", pady=(0, 4))
+            ttk.Button(ctrl, text="+ Add choice", command=self._add_choice).pack(side="left")
+            ttk.Button(ctrl, text="\u2212 Remove last choice", command=self._remove_choice).pack(side="left", padx=6)
+            keys = sorted(k for k in card if k.startswith("choice_"))
+            if not keys:
+                card["choice_a"] = {"label": "", "effects": []}
+                card["choice_b"] = {"label": "", "effects": []}
+                keys = ["choice_a", "choice_b"]
+            for ck in keys:
                 ch = card.setdefault(ck, {"label": "", "effects": []})
-                lf = ttk.LabelFrame(self.body, text=title, padding=6)
+                lf = ttk.LabelFrame(self.body, text="Choice " + ck.split("_")[-1].upper(), padding=6)
                 lf.pack(fill="both", expand=True, pady=3)
                 row = ttk.Frame(lf); row.pack(fill="x")
                 ttk.Label(row, text="label").pack(side="left")
@@ -1158,6 +1231,34 @@ class App(tk.Tk):
             lf = ttk.LabelFrame(self.body, text="Effects (applied when drawn)", padding=6)
             lf.pack(fill="both", expand=True)
             self._effects_editor(lf, card.setdefault("effects", []))
+
+    def _add_choice(self):
+        if not self.current_id:
+            return
+        self._commit_current()
+        _, c = self.deck.find_card(self.current_id)
+        if not c or c.get("type") != "decision":
+            return
+        used = {k.split("_")[-1] for k in c if k.startswith("choice_")}
+        nxt = next((ch for ch in "abcdefghijklmnopqrstuvwxyz" if ch not in used), None)
+        if nxt is None:
+            return
+        c["choice_" + nxt] = {"label": "", "effects": []}
+        self._build_body(c)
+
+    def _remove_choice(self):
+        if not self.current_id:
+            return
+        self._commit_current()
+        _, c = self.deck.find_card(self.current_id)
+        if not c or c.get("type") != "decision":
+            return
+        keys = sorted(k for k in c if k.startswith("choice_"))
+        if len(keys) <= 2:
+            messagebox.showinfo("Choices", "A decision needs at least two choices.")
+            return
+        c.pop(keys[-1], None)
+        self._build_body(c)
 
     def _effects_editor(self, parent, effects_list):
         ed = ListEditor(parent, self, effects_list,
@@ -1352,129 +1453,48 @@ class App(tk.Tk):
 
     def _story_graph(self):
         self._commit_current()
-        typeof = {c.get("id"): c.get("type", "") for _, c in self.deck.iter_cards()}
-        edges = []
-        for _, c in self.deck.iter_cards():
-            src = c.get("id")
-            for tgt, kind in card_link_edges(c):
-                edges.append((src, tgt, kind))
-        nodes = sorted(set([a for a, _, _ in edges] + [b for _, b, _ in edges]))
-        if not nodes:
-            messagebox.showinfo("Story graph",
-                                "No linked cards yet.\nAdd an inject_cards or delayed_card effect to connect two cards.")
-            return
-
-        # group cards into weakly-connected components so separate storylines
-        # render as separate, clearly-labelled bands instead of one tangle.
-        adj_u = {n: set() for n in nodes}
-        for a, b, _k in edges:
-            adj_u[a].add(b); adj_u[b].add(a)
-        seen = set(); components = []
-        for n in nodes:
-            if n in seen:
-                continue
-            comp = []; stack = [n]; seen.add(n)
-            while stack:
-                x = stack.pop(); comp.append(x)
-                for y in adj_u[x]:
-                    if y not in seen:
-                        seen.add(y); stack.append(y)
-            components.append(sorted(comp))
-
-        NW, NH, COLW, ROWH = 168, 46, 240, 92
-        colors = {"intel": "#B5D4F4", "event": "#FAC775", "decision": "#CECBF6"}
-        pos = {}
-        comp_labels = []     # (y, text)
-        comp_seps = []       # y of a faint divider between bands
-        band_top = 70
-        BAND_GAP = 72
-        for ci, comp in enumerate(components):
-            cset = set(comp)
-            c_edges = [(a, b, k) for a, b, k in edges if a in cset and b in cset]
-            layer = compute_layers(comp, c_edges)
-            order = {}
-            for n in comp:
-                order.setdefault(layer[n], []).append(n)
-            for L in order:
-                order[L].sort()
-            Ls = sorted(order)
-            preds = {n: [] for n in comp}; succs = {n: [] for n in comp}
-            for a, b, _k in c_edges:
-                succs[a].append(b); preds[b].append(a)
-            for _sweep in range(4):   # barycenter ordering — pulls linked nodes inline
-                for L in Ls[1:]:
-                    pi = {x: i for i, x in enumerate(order[L - 1])}
-                    cur = {x: i for i, x in enumerate(order[L])}
-                    order[L].sort(key=lambda n: (sum(pi.get(p, 0) for p in preds[n]) / len(preds[n])) if preds[n] else cur[n])
-                for L in reversed(Ls[:-1]):
-                    si = {x: i for i, x in enumerate(order[L + 1])}
-                    cur = {x: i for i, x in enumerate(order[L])}
-                    order[L].sort(key=lambda n: (sum(si.get(s, 0) for s in succs[n]) / len(succs[n])) if succs[n] else cur[n])
-            max_rows = max((len(order[L]) for L in Ls), default=1)
-            if ci > 0:
-                comp_seps.append(band_top - BAND_GAP / 2)
-            comp_labels.append((band_top - 26, "pathway %d" % (ci + 1)))
-            for L in Ls:
-                ns = order[L]
-                off = (max_rows - len(ns)) / 2.0
-                for i, n in enumerate(ns):
-                    pos[n] = [40 + L * COLW, band_top + (i + off) * ROWH]
-            band_top += max_rows * ROWH + BAND_GAP
-        graph_w = max((p[0] for p in pos.values()), default=200) + NW + 60
-
         win = tk.Toplevel(self)
-        win.title("Story graph — drag nodes · double-click to edit")
-        win.geometry("900x600")
+        win.title("Story graph")
+        win.geometry("980x700")
+
+        bar = ttk.Frame(win, padding=4)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(bar, text="show:").pack(side="left")
+        filter_var = tk.StringVar(value="All storylines")
+        filter_cb = ttk.Combobox(bar, textvariable=filter_var, state="readonly", width=34)
+        filter_cb.pack(side="left", padx=4)
+        link_mode = tk.BooleanVar(value=False)
+        status_var = tk.StringVar(value="drag to move \u00b7 double-click to edit \u00b7 right-click an arrow to delete it")
+        ttk.Checkbutton(bar, text="Link mode", variable=link_mode,
+                        command=lambda: status_var.set("Link mode: click a source card, then its target."
+                                                       if link_mode.get() else "")).pack(side="left", padx=8)
+        ttk.Label(bar, textvariable=status_var, foreground="#888").pack(side="left", padx=8)
+
         canvas = tk.Canvas(win, background="white", highlightthickness=0)
         hbar = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
         vbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
         canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        vbar.grid(row=0, column=1, sticky="ns")
-        hbar.grid(row=1, column=0, sticky="ew")
-        win.rowconfigure(0, weight=1)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        vbar.grid(row=1, column=1, sticky="ns")
+        hbar.grid(row=2, column=0, sticky="ew")
+        win.rowconfigure(1, weight=1)
         win.columnconfigure(0, weight=1)
 
-        # legend
-        canvas.create_line(20, 24, 52, 24, fill="#777", arrow="last")
-        canvas.create_text(58, 24, text="inject (now)", anchor="w", font=("TkDefaultFont", 8), fill="#444")
-        canvas.create_line(170, 24, 202, 24, fill="#777", arrow="last", dash=(4, 3))
-        canvas.create_text(208, 24, text="delayed (later)", anchor="w", font=("TkDefaultFont", 8), fill="#444")
-
-        def redraw_edges():
-            canvas.delete("edge")
-            for a, b, kind in edges:
-                if a not in pos or b not in pos:
-                    continue
-                ax, ay = pos[a]; bx, by = pos[b]
-                dash = (4, 3) if kind == "delayed_card" else ()
-                canvas.create_line(ax + NW, ay + NH / 2, bx, by + NH / 2,
-                                   arrow="last", fill="#777", dash=dash, tags=("edge",))
-            canvas.tag_lower("edge")
-
-        def draw_node(n):
-            x, y = pos[n]
-            tag = "n_" + n
-            canvas.create_rectangle(x, y, x + NW, y + NH, fill=colors.get(typeof.get(n, ""), "#D3D1C7"),
-                                    outline="#555", width=1, tags=(tag, "node"))
-            canvas.create_text(x + NW / 2, y + NH / 2 - 7, text=n, width=NW - 10,
-                               font=("TkDefaultFont", 8), fill="#1a1a1a", tags=(tag, "node"))
-            canvas.create_text(x + NW / 2, y + NH / 2 + 11, text=typeof.get(n, ""),
-                               font=("TkDefaultFont", 7), fill="#555", tags=(tag,))
-
-        for (ly, lt) in comp_labels:
-            canvas.create_text(12, ly, text=lt, anchor="w",
-                               font=("TkDefaultFont", 9, "bold"), fill="#999", tags=("sep",))
-        for sy in comp_seps:
-            canvas.create_line(8, sy, graph_w, sy, fill="#e2e2e2", dash=(2, 4), tags=("sep",))
-
-        for n in nodes:
-            draw_node(n)
-        redraw_edges()
-        canvas.tag_lower("sep")
-        canvas.configure(scrollregion=canvas.bbox("all"))
-
+        colors = {"intel": "#B5D4F4", "event": "#FAC775", "decision": "#CECBF6"}
+        NW, NH = 168, 46
+        pos = {}
+        edge_items = {}
         drag = {"n": None, "x": 0, "y": 0}
+        state = {"src": None}
+        shown = {"E": []}
+
+        def gather():
+            typeof = {c.get("id"): c.get("type", "") for _, c in self.deck.iter_cards()}
+            E = []
+            for _, c in self.deck.iter_cards():
+                for tgt, kind, ck, clabel in card_link_edges(c):
+                    E.append((c.get("id"), tgt, kind, clabel))
+            return typeof, E
 
         def node_at(e):
             item = canvas.find_closest(canvas.canvasx(e.x), canvas.canvasy(e.y))
@@ -1483,12 +1503,134 @@ class App(tk.Tk):
                     return t[2:]
             return None
 
+        def redraw_edges():
+            canvas.delete("edge")
+            edge_items.clear()
+            for a, b, kind, clabel in shown["E"]:
+                if a not in pos or b not in pos:
+                    continue
+                ax, ay = pos[a]; bx, by = pos[b]
+                dash = (4, 3) if kind == "delayed_card" else ()
+                lid = canvas.create_line(ax + NW, ay + NH / 2, bx, by + NH / 2,
+                                         arrow="last", fill="#777", dash=dash, tags=("edge",))
+                edge_items[lid] = (a, b)
+                if clabel:
+                    mx = (ax + NW + bx) / 2; my = (ay + by) / 2 + NH / 2
+                    txt = clabel if len(clabel) <= 16 else clabel[:15] + "\u2026"
+                    canvas.create_text(mx, my - 7, text=txt, font=("TkDefaultFont", 7),
+                                       fill="#3C3489", tags=("edge",))
+            canvas.tag_lower("edge")
+
+        def add_link(srcid, tgt):
+            _, c = self.deck.find_card(srcid)
+            if not c:
+                return
+            if c.get("type") == "decision":
+                keys = sorted(k for k in c if k.startswith("choice_"))
+                ck = self._choose_option(
+                    "Attach this link to which choice of '%s'?" % srcid,
+                    [(k, "%s \u2014 %s" % (k.split("_")[-1].upper(), c[k].get("label", ""))) for k in keys])
+                if not ck:
+                    return
+                lst = c[ck].setdefault("effects", [])
+            else:
+                lst = c.setdefault("effects", [])
+            for eff in lst:
+                if eff.get("type") == "inject_cards":
+                    if tgt not in eff.setdefault("ids", []):
+                        eff["ids"].append(tgt)
+                    break
+            else:
+                lst.append({"type": "inject_cards", "ids": [tgt], "position": "soon"})
+            self._refresh_tree()
+            if self.current_id in (srcid, tgt):
+                self._load_card(self.current_id)
+
+        def del_link(srcid, tgt):
+            _, c = self.deck.find_card(srcid)
+            if not c:
+                return
+            for _ck, _lbl, lst in card_effect_sources(c):
+                i = 0
+                while i < len(lst):
+                    eff = lst[i]; t = eff.get("type")
+                    if t in ("inject_cards", "remove_cards") and tgt in eff.get("ids", []):
+                        eff["ids"] = [x for x in eff["ids"] if x != tgt]
+                        if not eff["ids"]:
+                            lst.pop(i); continue
+                    elif t == "delayed_card" and eff.get("id") == tgt:
+                        lst.pop(i); continue
+                    i += 1
+            self._refresh_tree()
+            if self.current_id in (srcid, tgt):
+                self._load_card(self.current_id)
+
+        def render():
+            canvas.delete("all")
+            pos.clear()
+            typeof, E = gather()
+            nodes = sorted(set([a for a, _, _, _ in E] + [b for _, b, _, _ in E]))
+            _fp, _fl, _fs, _fw, comps = layout_components(nodes, E)
+            opts = ["All storylines"] + ["pathway %d: %s" % (i + 1, c[0]) for i, c in enumerate(comps)]
+            filter_cb["values"] = opts
+            sel = filter_var.get()
+            if sel not in opts:
+                sel = "All storylines"; filter_var.set(sel)
+            show = set(nodes) if sel == "All storylines" else set(comps[opts.index(sel) - 1])
+            Eshow = [e for e in E if e[0] in show and e[1] in show]
+            sub = sorted(show)
+            lp, labels, seps, gw, _c = layout_components(sub, Eshow)
+            pos.update(lp)
+            shown["E"] = Eshow
+
+            canvas.create_line(20, 22, 52, 22, fill="#777", arrow="last")
+            canvas.create_text(58, 22, text="inject", anchor="w", font=("TkDefaultFont", 8), fill="#444")
+            canvas.create_line(118, 22, 150, 22, fill="#777", arrow="last", dash=(4, 3))
+            canvas.create_text(156, 22, text="delayed", anchor="w", font=("TkDefaultFont", 8), fill="#444")
+            for (ly, lt, _root) in labels:
+                canvas.create_text(12, ly, text=lt, anchor="w",
+                                   font=("TkDefaultFont", 9, "bold"), fill="#999", tags=("sep",))
+            for sy in seps:
+                canvas.create_line(8, sy, gw, sy, fill="#e2e2e2", dash=(2, 4), tags=("sep",))
+            for n in sub:
+                if n not in pos:
+                    continue
+                x, y = pos[n]
+                tag = "n_" + n
+                hot = (state["src"] == n)
+                canvas.create_rectangle(x, y, x + NW, y + NH,
+                                        fill=colors.get(typeof.get(n, ""), "#D3D1C7"),
+                                        outline="#d62728" if hot else "#555", width=2 if hot else 1,
+                                        tags=(tag, "node"))
+                canvas.create_text(x + NW / 2, y + NH / 2 - 7, text=n, width=NW - 10,
+                                   font=("TkDefaultFont", 8), fill="#1a1a1a", tags=(tag, "node"))
+                canvas.create_text(x + NW / 2, y + NH / 2 + 11, text=typeof.get(n, ""),
+                                   font=("TkDefaultFont", 7), fill="#555", tags=(tag,))
+            redraw_edges()
+            canvas.tag_lower("sep")
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
         def on_press(e):
-            drag["n"] = node_at(e)
+            n = node_at(e)
+            if link_mode.get():
+                if not n:
+                    return
+                if state["src"] is None:
+                    state["src"] = n
+                    status_var.set("source: %s \u2014 now click the target card" % n)
+                    render()
+                else:
+                    if n != state["src"]:
+                        add_link(state["src"], n)
+                    state["src"] = None
+                    status_var.set("Link mode: click a source card, then its target.")
+                    render()
+                return
+            drag["n"] = n
             drag["x"] = canvas.canvasx(e.x); drag["y"] = canvas.canvasy(e.y)
 
         def on_motion(e):
-            if not drag["n"]:
+            if link_mode.get() or not drag["n"] or drag["n"] not in pos:
                 return
             cx, cy = canvas.canvasx(e.x), canvas.canvasy(e.y)
             dx, dy = cx - drag["x"], cy - drag["y"]
@@ -1498,6 +1640,8 @@ class App(tk.Tk):
             redraw_edges()
 
         def on_double(e):
+            if link_mode.get():
+                return
             n = node_at(e)
             if n:
                 self._commit_current()
@@ -1508,9 +1652,34 @@ class App(tk.Tk):
                 self._load_card(n)
                 self.lift()
 
+        def on_right(e):
+            item = canvas.find_closest(canvas.canvasx(e.x), canvas.canvasy(e.y))
+            if item and item[0] in edge_items:
+                s, t = edge_items[item[0]]
+                if messagebox.askyesno("Delete link", "Remove link  %s \u2192 %s ?" % (s, t)):
+                    del_link(s, t); render()
+
         canvas.bind("<Button-1>", on_press)
         canvas.bind("<B1-Motion>", on_motion)
         canvas.bind("<Double-Button-1>", on_double)
+        canvas.bind("<Button-3>", on_right)
+        filter_cb.bind("<<ComboboxSelected>>", lambda e: render())
+        render()
+
+    def _choose_option(self, prompt, options):
+        if not options:
+            return None
+        dlg = ModalDialog(self, "Choose")
+        ttk.Label(dlg.body, text=prompt, wraplength=360).pack(anchor="w", pady=(0, 6))
+        var = tk.StringVar(value=options[0][0])
+        for val, lbl in options:
+            ttk.Radiobutton(dlg.body, text=lbl, value=val, variable=var).pack(anchor="w")
+
+        def ok():
+            dlg.result = var.get(); dlg.destroy()
+        dlg._ok = ok
+        dlg.add_buttons()
+        return dlg.wait()
 
     def _story_map(self):
         self._commit_current()
