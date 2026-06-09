@@ -59,7 +59,6 @@ CARD_TYPES = ["intel", "event", "decision"]
 OP_PRESETS = ["add", "mul", "set"]
 STAT_PRESETS = ["move_block", "city_income", "attack"]
 POSITION_PRESETS = ["front", "soon", "random", "back"]
-PAY_PRESETS = ["pick_city", "player"]
 TEAM_OPTIONS = [("Player (1)", 1), ("Enemy (2)", 2), ("Neutral (0)", 0), ("Allied AI (3)", 3)]
 SCOPE_PRESETS = [
     "all", "player", "enemy", "neutral", "ground", "combatant", "supplier",
@@ -144,10 +143,6 @@ EFFECT_SCHEMA = {
         ("scope", "scope", None),
         ("amount", "num", None),
     ],
-    "grant_rails": [("amount", "int", "rail segments added to the player's stock")],
-    "grant_train": [("amount", "int", "trains added to the player's stock")],
-    "grant_bridges": [("amount", "int", "bridges added to the stock")],
-    "grant_tunnels": [("amount", "int", "tunnels added to the stock")],
     "script": [
         ("fn", "script_ref", None),
         ("params", "raw", None),
@@ -1267,8 +1262,6 @@ class App(tk.Tk):
         for w in self.body.winfo_children():
             w.destroy()
         self._choice_vars = {}
-        self._choice_cost = {}
-        self._choice_pay = {}
         if card.get("type") == "decision":
             ctrl = ttk.Frame(self.body); ctrl.pack(fill="x", pady=(0, 4))
             ttk.Button(ctrl, text="+ Add choice", command=self._add_choice).pack(side="left")
@@ -1283,22 +1276,19 @@ class App(tk.Tk):
                 lf = ttk.LabelFrame(self.body, text="Choice " + ck.split("_")[-1].upper(), padding=6)
                 lf.pack(fill="both", expand=True, pady=3)
                 row = ttk.Frame(lf); row.pack(fill="x")
+                
+                # Label Input
                 ttk.Label(row, text="label").pack(side="left")
-                v = tk.StringVar(value=ch.get("label", ""))
-                ttk.Entry(row, textvariable=v).pack(side="left", fill="x", expand=True, padx=6)
-                self._choice_vars[ck] = v
-                crow = ttk.Frame(lf); crow.pack(fill="x", pady=(2, 0))
-                ttk.Label(crow, text="cost").pack(side="left")
-                cv = tk.StringVar(value=str(ch.get("cost", "")) if ch.get("cost") else "")
-                ttk.Entry(crow, textvariable=cv, width=8).pack(side="left", padx=4)
-                self._choice_cost[ck] = cv
-                ttk.Label(crow, text="pay from").pack(side="left", padx=(8, 0))
-                pv = tk.StringVar(value=ch.get("pay_from", "pick_city"))
-                ttk.Combobox(crow, textvariable=pv, values=PAY_PRESETS, state="readonly", width=10).pack(side="left", padx=4)
-                self._choice_pay[ck] = pv
-                ttk.Label(crow, text="(cost > 0 makes this a purchase — player picks a city to pay)",
-                          foreground="#888").pack(side="left", padx=6)
-                self._effects_editor(lf, ch.setdefault("effects", []))
+                v_lbl = tk.StringVar(value=ch.get("label", ""))
+                ttk.Entry(row, textvariable=v_lbl).pack(side="left", fill="x", expand=True, padx=6)
+                
+                # Cost Input (NEW)
+                ttk.Label(row, text="cost").pack(side="left")
+                v_cost = tk.StringVar(value=str(ch.get("cost", "")))
+                ttk.Entry(row, textvariable=v_cost, width=8).pack(side="left", padx=6)
+                
+                # Store BOTH variables so we can save them later
+                self._choice_vars[ck] = {"label": v_lbl, "cost": v_cost}
         else:
             lf = ttk.LabelFrame(self.body, text="Effects (applied when drawn)", padding=6)
             lf.pack(fill="both", expand=True)
@@ -1363,15 +1353,6 @@ class App(tk.Tk):
         for ck, var in self._choice_vars.items():
             if isinstance(c.get(ck), dict):
                 c[ck]["label"] = var.get()
-                cv = self._choice_cost.get(ck)
-                cost_s = cv.get().strip() if cv else ""
-                if cost_s and parse_num(cost_s) > 0:
-                    c[ck]["cost"] = int(parse_num(cost_s))
-                    pv = self._choice_pay.get(ck)
-                    c[ck]["pay_from"] = (pv.get() if pv else "pick_city") or "pick_city"
-                else:
-                    c[ck].pop("cost", None)
-                    c[ck].pop("pay_from", None)
         # id change
         if new_id and new_id != self.current_id:
             old = self.current_id
