@@ -21,19 +21,29 @@ for it automatically. Each field is (key, kind, extra):
     "int" / "num"   number (int, or int/float)
     "bool"          checkbox
     "choice"        dropdown, extra = list of options
+    "combo"         EDITABLE dropdown, extra = list of presets (free text ok)
     "scope"         editable dropdown of common scope strings
+    "near"          editable dropdown of spawn/reveal anchors
     "op"            add / mul / set
+    "rawval"        typed value: true/false/numbers parsed, else string
     "list_str"      comma-separated -> list of strings
     "card_ref"      one card id (dropdown of existing ids)
     "card_ref_list" several card ids
     "set_ref"       one set id
     "script_ref"    a function name from card_scripts.gd
     "modifier_list" a list of modifier dicts (nested editor)
+    "attack_spec"   damage + range -> {"damage": n, "range": n} (grant_attack)
     "effect"        a single nested effect (nested editor, e.g. delayed_effect)
     "raw"           free-form JSON (escape hatch for anything)
 
 Any effect type NOT in EFFECT_SCHEMA is still fully editable as raw JSON, and
 every form has a "Raw JSON" toggle, so the tool can never block you.
+
+Game-side references (keep in sync with the GDScript):
+    trigger events   -> CardManager.notify() calls / Events bus
+    requires keys    -> CardManager._one_requirement()
+    dynamic_text     -> IntelGenerator.generate() + "war_report"
+    effect types     -> CardResolver._resolve_one()
 """
 
 import sys
@@ -60,12 +70,38 @@ OP_PRESETS = ["add", "mul", "set"]
 STAT_PRESETS = ["move_block", "city_income", "attack"]
 POSITION_PRESETS = ["front", "soon", "random", "back"]
 PAY_PRESETS = ["pick_city", "player"]
-TEAM_OPTIONS = [("Player (1)", 1), ("Enemy (2)", 2), ("Neutral (0)", 0), ("Allied AI (3)", 3)]
+TEAM_OPTIONS = [("Player (1)", 1), ("Enemy (2)", 2), ("Neutral (0)", 0), ("Coalition (3)", 3)]
 SCOPE_PRESETS = [
     "all", "player", "enemy", "neutral", "ground", "combatant", "supplier",
     "city", "train", "type:infantry", "type:artillery", "type:logistics",
-    "team:1", "team:2", "tag:",
+    "team:1", "team:2", "tag:", "name:",
 ]
+
+# Where spawn_unit / reveal_area anchor. Free text also accepts a city name
+# or [q, r] coordinates.
+NEAR_PRESETS = ["player_capital", "enemy_capital", "purchased_city"]
+
+# Board events that can inject a card (CardManager.notify / day triggers).
+TRIGGER_EVENTS = [
+    "day", "rail_established", "enemy_city_captured", "neutral_city_captured",
+    "city_lost", "unit_died", "unit_exhausted",
+]
+
+# Live-text generators (IntelGenerator + the battle-log report).
+DYNAMIC_TEXTS = ["recon_report", "economy_report", "war_report"]
+
+# World facts usable in a card's `requires` (CardManager._one_requirement).
+REQUIRES_KEYS = [
+    "season", "weather", "train_exists", "has_unit_type", "chain_active",
+    "min_day", "max_day", "day", "week", "unit_count", "city_count",
+    "train_count", "rail_count", "bridge_count",
+]
+REQ_NUMERIC_KEYS = {"day", "week", "unit_count", "city_count", "train_count",
+                    "rail_count", "bridge_count"}
+REQ_OPS = [">=", "<=", ">", "<", "==", "!="]
+SEASON_PRESETS = ["spring", "summer", "autumn", "winter"]
+WEATHER_PRESETS = ["clear", "snow", "winter", "rain", "mud"]
+UNIT_PRESETS = ["infantry", "artillery", "logistics"]
 
 # A modifier sub-dict (used inline by add_modifier and inside set_weather).
 MODIFIER_FIELDS = [
@@ -82,7 +118,7 @@ MODIFIER_FIELDS = [
 # effect type -> list of (key, kind, extra)
 EFFECT_SCHEMA = {
     "set_weather": [
-        ("name", "text", None),
+        ("name", "combo", WEATHER_PRESETS),
         ("modifiers", "modifier_list", None),
     ],
     "add_modifier": [
@@ -100,7 +136,7 @@ EFFECT_SCHEMA = {
     "inject_cards": [
         ("ids", "card_ref_list", None),
         ("position", "choice", POSITION_PRESETS),
-        ("after_days", "int", "0 = now, >0 = appears that many days later"),
+        ("after_days", "int", "0 = now, >0 = appears that many weeks later"),
     ],
     "remove_cards": [("ids", "card_ref_list", None)],
     "add_set": [("set", "set_ref", None), ("position", "choice", POSITION_PRESETS)],
@@ -108,19 +144,20 @@ EFFECT_SCHEMA = {
     "delayed_card": [
         ("id", "card_ref", None),
         ("after_days", "int", None),
+        ("position", "choice", POSITION_PRESETS),
     ],
     "delayed_effect": [
         ("after_days", "int", None),
         ("effect", "effect", None),
     ],
     "spawn_unit": [
-        ("unit", "choice", ["infantry", "artillery", "logistics"]),
+        ("unit", "choice", UNIT_PRESETS),
         ("team", "team", None),
-        ("near", "text", None),
-        ("unit_type", "text", None),
+        ("near", "near", None),
+        ("unit_type", "text", "for scopes like type:commando (optional)"),
         ("fill", "bool", None),
         ("max_resources", "int", None),
-        ("name", "text", None),
+        ("name", "text", "blank = auto-generated company name"),
         ("tags", "list_str", None),
         ("modifiers", "modifier_list", None),
     ],
@@ -130,10 +167,11 @@ EFFECT_SCHEMA = {
         ("combatants_only", "bool", None),
         ("unit_type", "text", None),
         ("rename", "text", None),
-        ("add_tags", "list_str", None),
+        ("add_tags", "list_str", "add 'combatant' with grant_attack to arm a non-combat unit"),
         ("max_resources", "int", None),
         ("set_resources", "int", None),
         ("replenish", "int", None),
+        ("grant_attack", "attack_spec", None),
         ("modifiers", "modifier_list", None),
     ],
     "grant_resources": [
@@ -148,12 +186,20 @@ EFFECT_SCHEMA = {
     "grant_train": [("amount", "int", "trains added to the player's stock")],
     "grant_bridges": [("amount", "int", "bridges added to the stock")],
     "grant_tunnels": [("amount", "int", "tunnels added to the stock")],
+    "reveal_area": [
+        ("near", "near", None),
+        ("radius", "int", "hexes around the point (default 2); lasts one week"),
+    ],
     "script": [
         ("fn", "script_ref", None),
         ("params", "raw", None),
     ],
-    "set_state": [("key", "text", None), ("value", "text", None)],
-    "restore_state": [("key", "text", None)],
+    "set_state": [("key", "text", None), ("value", "rawval", "true/false/numbers are typed")],
+    "restore_state": [
+        ("key", "text", None),
+        ("value", "rawval", "value to restore to"),
+        ("after_days", "int", None),
+    ],
 }
 
 EFFECT_TYPES = sorted(EFFECT_SCHEMA.keys())
@@ -173,6 +219,30 @@ def parse_num(s):
             return int(s)
         return float(s)
     except ValueError:
+        return s
+
+
+def parse_typed(s):
+    """Typed value parse: true/false/null, ints, floats, quoted or bare strings."""
+    s = str(s).strip()
+    if s == "":
+        return None
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low in ("null", "none"):
+        return None
+    if re.fullmatch(r"[-+]?\d+", s):
+        return int(s)
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        return json.loads(s)
+    except Exception:
         return s
 
 
@@ -244,6 +314,55 @@ def card_link_edges(card):
             for tgt, kind in targets(eff):
                 out.append((tgt, kind, ck, label))
     return out
+
+
+def card_set_edges(card):
+    """[(set_id, kind)] for card -> whole-set pulls (add_set / remove_set)."""
+    out = []
+
+    def walk(eff):
+        t = eff.get("type")
+        if t in ("add_set", "remove_set") and eff.get("set"):
+            out.append((eff["set"], t))
+        elif t == "delayed_effect":
+            walk(eff.get("effect", {}) or {})
+
+    for lst in card_effect_lists(card):
+        for eff in lst:
+            walk(eff)
+    return out
+
+
+def trigger_summary(trig):
+    if not isinstance(trig, dict) or not trig:
+        return "(none)"
+    ev = trig.get("event", "?")
+    bits = [ev]
+    if ev == "day":
+        bits.append("day %s" % trig.get("day", "?"))
+    if trig.get("count", 1) not in (1, None):
+        bits.append("x%s" % trig["count"])
+    extra = [f"{k}={v}" for k, v in trig.items()
+             if k not in ("event", "day", "count", "once", "position")]
+    bits += extra
+    if trig.get("once", True) is False:
+        bits.append("repeats")
+    if trig.get("position"):
+        bits.append("→ %s" % trig["position"])
+    return "  ".join(str(b) for b in bits)
+
+
+def requires_summary(req):
+    if not isinstance(req, dict) or not req:
+        return "(none)"
+    bits = []
+    for k, v in req.items():
+        if isinstance(v, dict):
+            for op, n in v.items():
+                bits.append(f"{k} {op} {n}")
+        else:
+            bits.append(f"{k} = {v}" if not isinstance(v, bool) else (k if v else f"not {k}"))
+    return ",  ".join(bits)
 
 
 def compute_layers(nodes, edges):
@@ -461,6 +580,49 @@ class Deck:
             fns.update(f)
         return sorted(fns)
 
+    def pulled_sets(self):
+        """Set ids that some card pulls in via add_set."""
+        out = set()
+        for _, c in self.iter_cards():
+            for sid, kind in card_set_edges(c):
+                if kind == "add_set":
+                    out.add(sid)
+        return out
+
+    def stats(self):
+        """Counts for the statistics panel."""
+        per_set = {}        # sid -> {type: n}
+        totals = {t: 0 for t in CARD_TYPES}
+        start_weight = {t: 0.0 for t in CARD_TYPES}
+        n_trigger = n_requires = n_dynamic = n_script = 0
+        choice_counts = []
+        for sid, c in self.iter_cards():
+            t = c.get("type", "?")
+            per_set.setdefault(sid, {})
+            per_set[sid][t] = per_set[sid].get(t, 0) + 1
+            if t in totals:
+                totals[t] += 1
+            if self.sets[sid].get("startable") and not c.get("trigger"):
+                if t in start_weight:
+                    start_weight[t] += float(c.get("weight", 1) or 1)
+            if c.get("trigger"):
+                n_trigger += 1
+            if c.get("requires"):
+                n_requires += 1
+            if c.get("dynamic_text"):
+                n_dynamic += 1
+            _, _, fns = self.references_from(c)
+            if fns:
+                n_script += 1
+            if t == "decision":
+                choice_counts.append(len([k for k in c if k.startswith("choice_")]))
+        return {
+            "per_set": per_set, "totals": totals, "start_weight": start_weight,
+            "n_trigger": n_trigger, "n_requires": n_requires,
+            "n_dynamic": n_dynamic, "n_script": n_script,
+            "choice_counts": choice_counts,
+        }
+
     def validate(self, known_scripts=None):
         issues = []
         ids = self.all_card_ids()
@@ -476,6 +638,12 @@ class Deck:
                 issues.append(("error", f"Duplicate card id '{cid}' ({n} copies)."))
         idset = set(ids)
         setset = set(self.set_ids())
+        pulled = self.pulled_sets()
+        referenced = set()
+        for _, c in self.iter_cards():
+            cards, _, _ = self.references_from(c)
+            referenced.update(cards)
+
         for sid, c in self.iter_cards():
             cid = c.get("id", "?")
             t = c.get("type")
@@ -493,6 +661,34 @@ class Deck:
             else:
                 if c.get("choice_a") or c.get("choice_b"):
                     issues.append(("warn", f"'{cid}': {t} card has choices (ignored at runtime)."))
+
+            # trigger sanity
+            trig = c.get("trigger")
+            if isinstance(trig, dict) and trig:
+                ev = trig.get("event", "")
+                if ev not in TRIGGER_EVENTS:
+                    issues.append(("warn", f"'{cid}': unknown trigger event '{ev}'."))
+                if ev == "day" and not trig.get("day"):
+                    issues.append(("warn", f"'{cid}': day-trigger with no 'day' value."))
+
+            # requires sanity
+            req = c.get("requires")
+            if isinstance(req, dict):
+                for k in req:
+                    if k not in REQUIRES_KEYS:
+                        issues.append(("warn", f"'{cid}': unknown requires key '{k}' (treated as a numeric world fact at runtime)."))
+
+            # dynamic_text sanity
+            dt = c.get("dynamic_text")
+            if dt and dt not in DYNAMIC_TEXTS:
+                issues.append(("warn", f"'{cid}': unknown dynamic_text '{dt}'."))
+
+            # effect-level sanity
+            for lst in card_effect_lists(c):
+                for eff in lst:
+                    if eff.get("type") == "spawn_unit" and eff.get("unit") not in UNIT_PRESETS:
+                        issues.append(("warn", f"'{cid}': spawn_unit with unknown unit '{eff.get('unit')}'."))
+
             cards, sets_, fns = self.references_from(c)
             for ref in cards:
                 if ref not in idset:
@@ -504,6 +700,13 @@ class Deck:
                 for fn in fns:
                     if fn not in known_scripts:
                         issues.append(("warn", f"'{cid}': script '{fn}' not found in card_scripts.gd."))
+
+            # unreachable content: a card in a non-startable set that nothing
+            # injects, no trigger fires and no add_set pulls is dead weight.
+            if not self.sets[sid].get("startable"):
+                reachable = (cid in referenced or bool(c.get("trigger")) or sid in pulled)
+                if not reachable:
+                    issues.append(("warn", f"'{cid}' is UNREACHABLE: set '{sid}' isn't startable, nothing injects it, no trigger, set never add_set."))
         return issues
 
 
@@ -543,8 +746,8 @@ def parse_script_names(path):
                     names.append(m.group(1))
     except Exception:
         pass
-    # 'run' is the dispatcher, not a card script
-    return [n for n in names if n != "run"]
+    # dispatcher/lifecycle funcs, not card scripts
+    return [n for n in names if n not in ("run", "setup")]
 
 
 def append_script_stub(path, fn_name):
@@ -552,9 +755,11 @@ def append_script_stub(path, fn_name):
     if fn_name in existing:
         return False
     stub = (
-        f"\nfunc {fn_name}(game: Node, ctx: Dictionary) -> void:\n"
-        f"\t# TODO: implement '{fn_name}'. 'game' is the Game node, 'ctx' is the\n"
-        f"\t# effect dict from the card (so you can read custom params you set).\n"
+        f"\nfunc {fn_name}(ctx: Dictionary) -> void:\n"
+        f"\t# TODO: implement '{fn_name}'. `s` is the GameServices bundle:\n"
+        f"\t# s.board (units/cities/spawn_unit), s.modifiers, s.weather,\n"
+        f"\t# s.card_manager, s.rail_network, s.terrain, s.fow ...\n"
+        f"\t# `ctx` is the effect dict from the card (read custom params).\n"
         f"\tpass\n"
     )
     with open(path, "a", encoding="utf-8") as fh:
@@ -571,10 +776,10 @@ def effect_summary(eff):
     if t in ("inject_cards", "remove_cards"):
         return f"{t}: {eff.get('ids',[])} {eff.get('position','') if t=='inject_cards' else ''}".strip()
     if t == "delayed_card":
-        return f"delayed_card: {eff.get('id','?')} in {eff.get('after_days','?')}d"
+        return f"delayed_card: {eff.get('id','?')} in {eff.get('after_days','?')}w"
     if t == "delayed_effect":
         inner = eff.get("effect", {}) or {}
-        return f"delayed_effect (+{eff.get('after_days','?')}d): {inner.get('type','?')}"
+        return f"delayed_effect (+{eff.get('after_days','?')}w): {inner.get('type','?')}"
     if t in ("add_set", "remove_set"):
         return f"{t}: {eff.get('set','?')}"
     if t == "script":
@@ -582,9 +787,11 @@ def effect_summary(eff):
     if t in ("grant_resources", "drain_resources"):
         return f"{t}: {eff.get('amount','?')} ({eff.get('scope','?')})"
     if t == "spawn_unit":
-        return f"spawn_unit: {eff.get('count',1)}x {eff.get('unit_type','?')} -> team {eff.get('team','?')}"
+        return f"spawn_unit: {eff.get('unit','?')} team {eff.get('team','?')} near {eff.get('near','?')}"
     if t == "transform_unit":
-        return f"transform_unit: {eff.get('scope','?')} -> {eff.get('to','?')}"
+        return f"transform_unit: {eff.get('scope','?')} -> {eff.get('rename') or eff.get('unit_type') or '?'}"
+    if t == "reveal_area":
+        return f"reveal_area: r{eff.get('radius',2)} near {eff.get('near','?')}"
     return t
 
 
@@ -632,6 +839,13 @@ class FormBuilder:
             if kind == "int":
                 return lambda: (int(parse_num(var.get())) if str(var.get()).strip() else None)
             return lambda: (parse_num(var.get()) if str(var.get()).strip() else None)
+        if kind == "rawval":
+            var = tk.StringVar(value="" if value is None else
+                               (json.dumps(value) if isinstance(value, (dict, list)) else str(value)))
+            ttk.Entry(parent, textvariable=var, width=18).grid(row=r, column=1, sticky="w", padx=4, pady=3)
+            if isinstance(extra, str):
+                ttk.Label(parent, text=extra, foreground="#888").grid(row=r, column=2, sticky="w")
+            return lambda: parse_typed(var.get())
         if kind == "bool":
             var = tk.BooleanVar(value=bool(value))
             ttk.Checkbutton(parent, variable=var).grid(row=r, column=1, sticky="w", padx=4, pady=3)
@@ -641,6 +855,27 @@ class FormBuilder:
             cb = ttk.Combobox(parent, textvariable=var, values=extra or [], state="readonly")
             cb.grid(row=r, column=1, sticky="w", padx=4, pady=3)
             return lambda: var.get()
+        if kind == "combo":
+            var = tk.StringVar(value="" if value is None else str(value))
+            cb = ttk.Combobox(parent, textvariable=var, values=extra or [])
+            cb.grid(row=r, column=1, sticky="ew", padx=4, pady=3)
+            return lambda: var.get()
+        if kind == "near":
+            var = tk.StringVar(value="" if value is None else
+                               (json.dumps(value) if isinstance(value, list) else str(value)))
+            cb = ttk.Combobox(parent, textvariable=var, values=NEAR_PRESETS)
+            cb.grid(row=r, column=1, sticky="ew", padx=4, pady=3)
+            ttk.Label(parent, text="or a city name, or [q, r]", foreground="#888").grid(row=r, column=2, sticky="w")
+
+            def get_near():
+                s = var.get().strip()
+                if s.startswith("["):
+                    try:
+                        return json.loads(s)
+                    except Exception:
+                        return s
+                return s
+            return get_near
         if kind in ("scope", "op", "stat", "card_ref", "set_ref", "script_ref"):
             return self._combo(parent, r, kind, value)
         if kind == "list_str":
@@ -652,6 +887,8 @@ class FormBuilder:
             return self._card_ref_list(parent, r, value)
         if kind == "modifier_list":
             return self._modifier_list(parent, r, value)
+        if kind == "attack_spec":
+            return self._attack_spec(parent, r, value)
         if kind == "effect":
             return self._nested_effect(parent, r, value)
         if kind == "raw":
@@ -719,6 +956,31 @@ class FormBuilder:
                             on_edit=lambda m: ModifierDialog(self.app, m).result)
         editor.grid(row=r, column=1, columnspan=2, sticky="ew", padx=4, pady=3)
         return editor.get_items
+
+    def _attack_spec(self, parent, r, value):
+        frame = ttk.Frame(parent)
+        frame.grid(row=r, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+        value = value if isinstance(value, dict) else {}
+        dv = tk.StringVar(value=str(value.get("damage", "")) if value.get("damage") is not None and value else "")
+        rv = tk.StringVar(value=str(value.get("range", "")) if value.get("range") is not None and value else "")
+        ttk.Label(frame, text="damage").pack(side="left")
+        ttk.Entry(frame, textvariable=dv, width=6).pack(side="left", padx=(2, 8))
+        ttk.Label(frame, text="range").pack(side="left")
+        ttk.Entry(frame, textvariable=rv, width=6).pack(side="left", padx=2)
+        ttk.Label(frame, text="gives the unit a real gun (pair with add_tags: combatant)",
+                  foreground="#888").pack(side="left", padx=6)
+
+        def get():
+            d = dv.get().strip(); rg = rv.get().strip()
+            if not d and not rg:
+                return None
+            out = {}
+            if d:
+                out["damage"] = int(parse_num(d))
+            if rg:
+                out["range"] = int(parse_num(rg))
+            return out
+        return get
 
     def _nested_effect(self, parent, r, value):
         holder = {"eff": dict(value) if isinstance(value, dict) else {}}
@@ -833,12 +1095,14 @@ class ListEditor(ttk.Frame):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ModalDialog(tk.Toplevel):
-    def __init__(self, app, title):
-        super().__init__(app)
+    def __init__(self, app, title, parent=None):
+        # `parent` keeps the dialog on top of whichever window spawned it
+        # (e.g. the story graph) instead of always raising the main window.
+        super().__init__(parent or app)
         self.app = app
         self.result = None
         self.title(title)
-        self.transient(app)
+        self.transient(parent or app)
         self.resizable(True, False)
         self.body = ttk.Frame(self, padding=8)
         self.body.pack(fill="both", expand=True)
@@ -928,6 +1192,194 @@ class EffectDialog(ModalDialog):
         self.destroy()
 
 
+class SearchPicker(ModalDialog):
+    """Type-to-filter picker over a list of ids. Returns the chosen id."""
+
+    def __init__(self, app, title, items, prompt="type to filter:", parent=None):
+        super().__init__(app, title, parent=parent)
+        self.items = sorted(items)
+        ttk.Label(self.body, text=prompt).pack(anchor="w")
+        self.var = tk.StringVar()
+        ent = ttk.Entry(self.body, textvariable=self.var, width=42)
+        ent.pack(fill="x", pady=(2, 4))
+        self.lb = tk.Listbox(self.body, height=12)
+        self.lb.pack(fill="both", expand=True)
+        self._refill()
+        ent.bind("<KeyRelease>", lambda e: self._refill())
+        ent.bind("<Return>", lambda e: self._ok())
+        ent.bind("<Down>", lambda e: (self.lb.focus_set(), self.lb.selection_set(0)))
+        self.lb.bind("<Double-Button-1>", lambda e: self._ok())
+        self.lb.bind("<Return>", lambda e: self._ok())
+        ent.focus_set()
+        self.add_buttons()
+        self.wait()
+
+    def _refill(self):
+        q = self.var.get().strip().lower()
+        self.lb.delete(0, "end")
+        for it in self.items:
+            if q in it.lower():
+                self.lb.insert("end", it)
+        if self.lb.size():
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(0)
+
+    def _ok(self):
+        sel = self.lb.curselection()
+        if sel:
+            self.result = self.lb.get(sel[0])
+        elif self.lb.size():
+            self.result = self.lb.get(0)
+        self.destroy()
+
+
+class TriggerDialog(ModalDialog):
+    """Edits a card's `trigger` dict — the board-event that injects the card."""
+
+    def __init__(self, app, trig):
+        super().__init__(app, "Trigger")
+        trig = dict(trig) if isinstance(trig, dict) else {}
+        b = self.body
+        self.v_event = tk.StringVar(value=trig.get("event", ""))
+        self.v_day = tk.StringVar(value=str(trig.get("day", "")) if trig.get("day") else "")
+        self.v_count = tk.StringVar(value=str(trig.get("count", "")) if trig.get("count") else "")
+        self.v_once = tk.BooleanVar(value=bool(trig.get("once", True)))
+        self.v_pos = tk.StringVar(value=trig.get("position", "soon"))
+        extra = {k: v for k, v in trig.items()
+                 if k not in ("event", "day", "count", "once", "position")}
+
+        ttk.Label(b, text="event").grid(row=0, column=0, sticky="e", padx=4, pady=3)
+        ttk.Combobox(b, textvariable=self.v_event, values=TRIGGER_EVENTS).grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        ttk.Label(b, text="('day' fires once the week is reached; others fire on board events)",
+                  foreground="#888").grid(row=0, column=2, sticky="w")
+        ttk.Label(b, text="day").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        ttk.Entry(b, textvariable=self.v_day, width=8).grid(row=1, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(b, text="only for event = day", foreground="#888").grid(row=1, column=2, sticky="w")
+        ttk.Label(b, text="count").grid(row=2, column=0, sticky="e", padx=4, pady=3)
+        ttk.Entry(b, textvariable=self.v_count, width=8).grid(row=2, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(b, text="fire on the Nth matching event (blank = 1st)", foreground="#888").grid(row=2, column=2, sticky="w")
+        ttk.Checkbutton(b, text="once (never fires again)", variable=self.v_once).grid(row=3, column=1, sticky="w", padx=4)
+        ttk.Label(b, text="position").grid(row=4, column=0, sticky="e", padx=4, pady=3)
+        ttk.Combobox(b, textvariable=self.v_pos, values=POSITION_PRESETS, state="readonly",
+                     width=10).grid(row=4, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(b, text="context matches").grid(row=5, column=0, sticky="ne", padx=4, pady=3)
+        self.extra_txt = tk.Text(b, height=3, width=40, wrap="word")
+        self.extra_txt.grid(row=5, column=1, columnspan=2, sticky="ew", padx=4, pady=3)
+        if extra:
+            self.extra_txt.insert("1.0", json.dumps(extra, indent=2))
+        ttk.Label(b, text='extra keys must equal the event context, e.g. {"by": 1}',
+                  foreground="#888").grid(row=6, column=1, columnspan=2, sticky="w", padx=4)
+        b.columnconfigure(1, weight=1)
+        self.add_buttons()
+        self.wait()
+
+    def _ok(self):
+        ev = self.v_event.get().strip()
+        if not ev:
+            self.result = {}        # empty = remove the trigger
+            self.destroy()
+            return
+        out = {"event": ev}
+        if self.v_day.get().strip():
+            out["day"] = int(parse_num(self.v_day.get()))
+        if self.v_count.get().strip():
+            out["count"] = int(parse_num(self.v_count.get()))
+        if not self.v_once.get():
+            out["once"] = False
+        if self.v_pos.get() and self.v_pos.get() != "soon":
+            out["position"] = self.v_pos.get()
+        raw = self.extra_txt.get("1.0", "end-1c").strip()
+        if raw:
+            try:
+                extra = json.loads(raw)
+                if isinstance(extra, dict):
+                    out.update(extra)
+            except Exception as ex:
+                messagebox.showerror("Invalid JSON", "Context matches: " + str(ex))
+                return
+        self.result = out
+        self.destroy()
+
+
+class RequiresDialog(ModalDialog):
+    """Edits a card's `requires` dict as rows of fact / op / value."""
+
+    def __init__(self, app, req):
+        super().__init__(app, "Requires (card stays in the deck until these hold)")
+        self.rows = []
+        self.rows_frame = ttk.Frame(self.body)
+        self.rows_frame.pack(fill="both", expand=True)
+        ttk.Button(self.body, text="+ Add requirement", command=self._add_row).pack(anchor="w", pady=4)
+        ttk.Label(self.body, foreground="#888", justify="left",
+                  text=("season/weather: text  •  train_exists: true/false  •  has_unit_type /\n"
+                        "chain_active: a type or set id  •  numeric facts take an operator")).pack(anchor="w")
+
+        req = req if isinstance(req, dict) else {}
+        for k, v in req.items():
+            if isinstance(v, dict):
+                for op, n in v.items():
+                    self._add_row(k, op, n)
+            else:
+                self._add_row(k, "=", v)
+        if not req:
+            self._add_row()
+        self.add_buttons()
+        self.wait()
+
+    def _add_row(self, key="", op="=", val=""):
+        row = ttk.Frame(self.rows_frame)
+        row.pack(fill="x", pady=2)
+        kv = tk.StringVar(value=key)
+        ov = tk.StringVar(value=op)
+        vv = tk.StringVar(value="" if val == "" else
+                          (json.dumps(val) if isinstance(val, (dict, list)) else str(val)))
+        kcb = ttk.Combobox(row, textvariable=kv, values=REQUIRES_KEYS, width=16)
+        kcb.pack(side="left", padx=2)
+        ttk.Combobox(row, textvariable=ov, values=["="] + REQ_OPS, width=4).pack(side="left", padx=2)
+        vcb = ttk.Combobox(row, textvariable=vv, width=16)
+        vcb.pack(side="left", padx=2)
+
+        def update_presets(_e=None):
+            k = kv.get().strip()
+            if k == "season":
+                vcb["values"] = SEASON_PRESETS
+            elif k == "weather":
+                vcb["values"] = WEATHER_PRESETS
+            elif k == "train_exists":
+                vcb["values"] = ["true", "false"]
+            elif k == "has_unit_type":
+                vcb["values"] = UNIT_PRESETS
+            elif k == "chain_active":
+                vcb["values"] = self.app.deck.set_ids()
+            else:
+                vcb["values"] = []
+        kcb.bind("<<ComboboxSelected>>", update_presets)
+        update_presets()
+        rec = {"row": row, "k": kv, "op": ov, "v": vv}
+        ttk.Button(row, text="✕", width=3,
+                   command=lambda: (row.destroy(), self.rows.remove(rec))).pack(side="left", padx=4)
+        self.rows.append(rec)
+
+    def _ok(self):
+        out = {}
+        for rec in self.rows:
+            k = rec["k"].get().strip()
+            if not k:
+                continue
+            op = rec["op"].get().strip() or "="
+            val = parse_typed(rec["v"].get())
+            if k in REQ_NUMERIC_KEYS and op in REQ_OPS and op != "=":
+                cur = out.get(k)
+                if isinstance(cur, dict):
+                    cur[op] = val
+                else:
+                    out[k] = {op: val}
+            else:
+                out[k] = val
+        self.result = out
+        self.destroy()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # GUI — main window
 # ──────────────────────────────────────────────────────────────────────────────
@@ -936,7 +1388,7 @@ class App(tk.Tk):
     def __init__(self, start_path=None):
         super().__init__()
         self.title("Card Forge")
-        self.geometry("1080x720")
+        self.geometry("1080x760")
         self.deck = Deck()
         self.scripts_path = None
         self.assets_root = None
@@ -944,6 +1396,8 @@ class App(tk.Tk):
         self.current_id = None
         self._preview_img = None
         self._choice_vars = {}   # ck -> StringVar (GUI-only, never stored in deck data)
+        self._trigger = {}       # working copy of the current card's trigger
+        self._requires = {}      # working copy of the current card's requires
 
         self._build_menu()
         self._build_layout()
@@ -988,6 +1442,7 @@ class App(tk.Tk):
 
         toolm = tk.Menu(m, tearoff=0)
         toolm.add_command(label="Validate deck", command=self._validate)
+        toolm.add_command(label="Deck statistics", command=self._statistics)
         toolm.add_command(label="Story graph", command=self._story_graph)
         toolm.add_command(label="Story map (text)", command=self._story_map)
         m.add_cascade(label="Tools", menu=toolm)
@@ -1034,6 +1489,7 @@ class App(tk.Tk):
         self.v_image = tk.StringVar()
         self.v_protected = tk.BooleanVar()
         self.v_weight = tk.StringVar()
+        self.v_dynamic = tk.StringVar()
 
         ttk.Label(meta, text="id").grid(row=0, column=0, sticky="e", padx=4, pady=3)
         ttk.Entry(meta, textvariable=self.v_id).grid(row=0, column=1, sticky="ew", padx=4, pady=3)
@@ -1052,22 +1508,44 @@ class App(tk.Tk):
         self.txt = tk.Text(meta, height=4, wrap="word")
         self.txt.grid(row=3, column=1, sticky="ew", padx=4, pady=3)
 
-        ttk.Label(meta, text="image").grid(row=4, column=0, sticky="e", padx=4, pady=3)
+        ttk.Label(meta, text="dynamic text").grid(row=4, column=0, sticky="e", padx=4, pady=3)
+        drow = ttk.Frame(meta); drow.grid(row=4, column=1, sticky="w", padx=4, pady=3)
+        ttk.Combobox(drow, textvariable=self.v_dynamic, values=[""] + DYNAMIC_TEXTS,
+                     width=18).pack(side="left")
+        ttk.Label(drow, text="generated from the live board at draw time (replaces text)",
+                  foreground="#888").pack(side="left", padx=6)
+
+        ttk.Label(meta, text="image").grid(row=5, column=0, sticky="e", padx=4, pady=3)
         imgrow = ttk.Frame(meta)
-        imgrow.grid(row=4, column=1, sticky="ew", padx=4, pady=3)
+        imgrow.grid(row=5, column=1, sticky="ew", padx=4, pady=3)
         imgrow.columnconfigure(0, weight=1)
         ttk.Entry(imgrow, textvariable=self.v_image).grid(row=0, column=0, sticky="ew")
         ttk.Button(imgrow, text="Browse…", command=self._browse_image).grid(row=0, column=1, padx=4)
         ttk.Button(imgrow, text="Preview", command=self._show_preview).grid(row=0, column=2)
+        ttk.Label(imgrow, text="(not rendered in-game yet — safe to fill in for later)",
+                  foreground="#888").grid(row=0, column=3, padx=4)
         ttk.Checkbutton(meta, text="protected (won't be drawn randomly)",
-                        variable=self.v_protected).grid(row=5, column=1, sticky="w", padx=4)
-        ttk.Label(meta, text="rarity").grid(row=6, column=0, sticky="e", padx=4, pady=3)
-        wrow = ttk.Frame(meta); wrow.grid(row=6, column=1, sticky="w", padx=4, pady=3)
+                        variable=self.v_protected).grid(row=6, column=1, sticky="w", padx=4)
+        ttk.Label(meta, text="rarity").grid(row=7, column=0, sticky="e", padx=4, pady=3)
+        wrow = ttk.Frame(meta); wrow.grid(row=7, column=1, sticky="w", padx=4, pady=3)
         ttk.Entry(wrow, textvariable=self.v_weight, width=8).pack(side="left")
         ttk.Label(wrow, text="relative weight in the starting deck — higher = more common (default 1)",
                   foreground="#888").pack(side="left", padx=6)
+
+        # trigger + requires
+        ttk.Label(meta, text="trigger ⚡").grid(row=8, column=0, sticky="e", padx=4, pady=3)
+        trow = ttk.Frame(meta); trow.grid(row=8, column=1, sticky="ew", padx=4, pady=3)
+        self.lbl_trigger = ttk.Label(trow, text="(none)", foreground="#555")
+        self.lbl_trigger.pack(side="left")
+        ttk.Button(trow, text="Edit…", width=7, command=self._edit_trigger).pack(side="right")
+        ttk.Label(meta, text="requires 🔒").grid(row=9, column=0, sticky="e", padx=4, pady=3)
+        rrow = ttk.Frame(meta); rrow.grid(row=9, column=1, sticky="ew", padx=4, pady=3)
+        self.lbl_requires = ttk.Label(rrow, text="(none)", foreground="#555")
+        self.lbl_requires.pack(side="left")
+        ttk.Button(rrow, text="Edit…", width=7, command=self._edit_requires).pack(side="right")
+
         self.preview = ttk.Label(meta)
-        self.preview.grid(row=0, column=2, rowspan=4, padx=8)
+        self.preview.grid(row=0, column=2, rowspan=5, padx=8)
 
         # effects / choices area (rebuilt per type)
         self.body = ttk.Frame(parent)
@@ -1083,6 +1561,18 @@ class App(tk.Tk):
 
         self.status = ttk.Label(parent, text="", foreground="#666")
         self.status.pack(anchor="w", pady=(4, 0))
+
+    def _edit_trigger(self):
+        res = TriggerDialog(self, self._trigger).result
+        if res is not None:
+            self._trigger = res
+            self.lbl_trigger.config(text=trigger_summary(res))
+
+    def _edit_requires(self):
+        res = RequiresDialog(self, self._requires).result
+        if res is not None:
+            self._requires = res
+            self.lbl_requires.config(text=requires_summary(res))
 
     # ---- script linkage ----
     def known_scripts(self):
@@ -1164,6 +1654,16 @@ class App(tk.Tk):
                 messagebox.showerror("Save failed", str(ex))
 
     # ---- tree ----
+    def _card_badges(self, c):
+        b = ""
+        if c.get("trigger"):
+            b += "⚡"
+        if c.get("requires"):
+            b += "🔒"
+        if c.get("dynamic_text"):
+            b += "≈"
+        return (b + " ") if b else ""
+
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         for sid, s in self.deck.sets.items():
@@ -1173,7 +1673,7 @@ class App(tk.Tk):
             for c in s.get("cards", []):
                 cid = c.get("id", "?")
                 self.tree.insert(node, "end", iid="card:" + cid,
-                                 text=f"  [{c.get('type','?')[:3]}] {cid}")
+                                 text=f"  [{c.get('type','?')[:3]}] {self._card_badges(c)}{cid}")
         self.set_cb.configure(values=self.deck.set_ids())
 
     def _tree_press(self, e):
@@ -1226,7 +1726,6 @@ class App(tk.Tk):
     def _edit_set(self, sid):
         self.current_id = None
         s = self.deck.sets.get(sid, {})
-        # lightweight set editor inline via dialog
         dlg = ModalDialog(self, f"Set: {sid}")
         v_label = tk.StringVar(value=s.get("label", ""))
         v_start = tk.BooleanVar(value=s.get("startable", False))
@@ -1257,6 +1756,11 @@ class App(tk.Tk):
         self.v_image.set(c.get("image", ""))
         self.v_protected.set(bool(c.get("protected", False)))
         self.v_weight.set(c.get("weight", 1))
+        self.v_dynamic.set(c.get("dynamic_text", ""))
+        self._trigger = copy.deepcopy(c.get("trigger", {})) if isinstance(c.get("trigger"), dict) else {}
+        self._requires = copy.deepcopy(c.get("requires", {})) if isinstance(c.get("requires"), dict) else {}
+        self.lbl_trigger.config(text=trigger_summary(self._trigger))
+        self.lbl_requires.config(text=requires_summary(self._requires))
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", c.get("text", ""))
         self._build_body(c)
@@ -1272,7 +1776,7 @@ class App(tk.Tk):
         if card.get("type") == "decision":
             ctrl = ttk.Frame(self.body); ctrl.pack(fill="x", pady=(0, 4))
             ttk.Button(ctrl, text="+ Add choice", command=self._add_choice).pack(side="left")
-            ttk.Button(ctrl, text="\u2212 Remove last choice", command=self._remove_choice).pack(side="left", padx=6)
+            ttk.Button(ctrl, text="− Remove last choice", command=self._remove_choice).pack(side="left", padx=6)
             keys = sorted(k for k in card if k.startswith("choice_"))
             if not keys:
                 card["choice_a"] = {"label": "", "effects": []}
@@ -1359,6 +1863,19 @@ class App(tk.Tk):
             c["image"] = img
         else:
             c.pop("image", None)
+        dt = self.v_dynamic.get().strip()
+        if dt:
+            c["dynamic_text"] = dt
+        else:
+            c.pop("dynamic_text", None)
+        if self._trigger:
+            c["trigger"] = copy.deepcopy(self._trigger)
+        else:
+            c.pop("trigger", None)
+        if self._requires:
+            c["requires"] = copy.deepcopy(self._requires)
+        else:
+            c.pop("requires", None)
         # commit choice labels (held in GUI-side vars, not in the deck data)
         for ck, var in self._choice_vars.items():
             if isinstance(c.get(ck), dict):
@@ -1502,7 +2019,6 @@ class App(tk.Tk):
                     self._preview_img = ImageTk.PhotoImage(im)
                 else:
                     self._preview_img = tk.PhotoImage(file=path)
-                    # crude downscale for big PNGs
                     w = self._preview_img.width()
                     if w > 160:
                         self._preview_img = self._preview_img.subsample(max(1, w // 140))
@@ -1518,7 +2034,7 @@ class App(tk.Tk):
         issues = self.deck.validate(known_scripts=known)
         win = tk.Toplevel(self)
         win.title("Validation")
-        win.geometry("620x420")
+        win.geometry("680x460")
         txt = tk.Text(win, wrap="word")
         txt.pack(fill="both", expand=True)
         if not issues:
@@ -1537,23 +2053,62 @@ class App(tk.Tk):
                     txt.insert("end", f"  • {m}\n")
         txt.config(state="disabled")
 
+    def _statistics(self):
+        self._commit_current()
+        st = self.deck.stats()
+        win = tk.Toplevel(self)
+        win.title("Deck statistics")
+        win.geometry("560x480")
+        txt = tk.Text(win, wrap="none", font=("Courier", 10))
+        txt.pack(fill="both", expand=True)
+
+        tot = st["totals"]
+        txt.insert("end", "TOTALS\n")
+        txt.insert("end", f"  intel: {tot.get('intel',0)}   event: {tot.get('event',0)}   decision: {tot.get('decision',0)}\n")
+        txt.insert("end", f"  with trigger ⚡: {st['n_trigger']}   gated 🔒: {st['n_requires']}"
+                          f"   dynamic ≈: {st['n_dynamic']}   scripted: {st['n_script']}\n\n")
+
+        sw = st["start_weight"]
+        total_w = sum(sw.values()) or 1
+        txt.insert("end", "STARTING DECK MIX (weighted, startable sets, no triggers)\n")
+        txt.insert("end", "  the draw cycle needs all three types — a thin column = filler cards\n")
+        for t in CARD_TYPES:
+            pct = 100.0 * sw[t] / total_w
+            bar = "█" * int(pct / 4)
+            txt.insert("end", f"  {t:<9} {sw[t]:>5.1f}  {pct:5.1f}%  {bar}\n")
+        txt.insert("end", "\nPER SET\n")
+        txt.insert("end", f"  {'set':<22}{'int':>5}{'evt':>5}{'dec':>5}{'all':>6}\n")
+        for sid in self.deck.set_ids():
+            row = st["per_set"].get(sid, {})
+            star = "★" if self.deck.sets[sid].get("startable") else " "
+            n_i = row.get("intel", 0); n_e = row.get("event", 0); n_d = row.get("decision", 0)
+            txt.insert("end", f" {star}{sid:<22}{n_i:>5}{n_e:>5}{n_d:>5}{(n_i+n_e+n_d):>6}\n")
+        cc = st["choice_counts"]
+        if cc:
+            txt.insert("end", f"\nDECISIONS: {len(cc)} cards, avg {sum(cc)/len(cc):.1f} choices"
+                              f" (min {min(cc)}, max {max(cc)})\n")
+        txt.config(state="disabled")
+
+    # ---- story graph ----
     def _story_graph(self):
         self._commit_current()
         win = tk.Toplevel(self)
         win.title("Story graph")
-        win.geometry("980x700")
+        win.geometry("1020x720")
 
         bar = ttk.Frame(win, padding=4)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Label(bar, text="show:").pack(side="left")
         filter_var = tk.StringVar(value="All storylines")
-        filter_cb = ttk.Combobox(bar, textvariable=filter_var, state="readonly", width=34)
+        filter_cb = ttk.Combobox(bar, textvariable=filter_var, width=34)   # editable: type to filter
         filter_cb.pack(side="left", padx=4)
         link_mode = tk.BooleanVar(value=False)
-        status_var = tk.StringVar(value="drag to move \u00b7 double-click to edit \u00b7 right-click an arrow to delete it")
+        status_var = tk.StringVar(value="drag to move · double-click to edit · right-click a card or arrow")
         ttk.Checkbutton(bar, text="Link mode", variable=link_mode,
                         command=lambda: status_var.set("Link mode: click a source card, then its target."
                                                        if link_mode.get() else "")).pack(side="left", padx=8)
+        find_btn = ttk.Button(bar, text="Find card…  (Ctrl+F)")
+        find_btn.pack(side="left", padx=4)
         ttk.Label(bar, textvariable=status_var, foreground="#888").pack(side="left", padx=8)
 
         canvas = tk.Canvas(win, background="white", highlightthickness=0)
@@ -1571,21 +2126,40 @@ class App(tk.Tk):
         pos = {}
         edge_items = {}
         drag = {"n": None, "x": 0, "y": 0}
-        state = {"src": None}
-        shown = {"E": []}
+        state = {"src": None, "pinned": set()}
+        shown = {"E": [], "cards": {}, "card_set": {}, "comps": [], "names": [],
+                 "orphans": [], "opts": []}
 
         def gather():
-            typeof = {c.get("id"): c.get("type", "") for _, c in self.deck.iter_cards()}
+            """All nodes (every card + set-nodes), every edge, and id -> set."""
+            cards = {}
+            card_set = {}
             E = []
-            for _, c in self.deck.iter_cards():
+            for sid, c in self.deck.iter_cards():
+                cards[c.get("id")] = c
+                card_set[c.get("id")] = sid
                 for tgt, kind, ck, clabel in card_link_edges(c):
                     E.append((c.get("id"), tgt, kind, clabel))
-            return typeof, E
+                for s2, kind in card_set_edges(c):
+                    E.append((c.get("id"), "set:" + s2, kind, ""))
+            return cards, E, card_set
+
+        def comp_label(comp, card_set):
+            """Name a storyline after the set most of its cards live in."""
+            counts = {}
+            for n in comp:
+                sid = n[4:] if n.startswith("set:") else card_set.get(n, "?")
+                counts[sid] = counts.get(sid, 0) + 1
+            best = max(counts, key=lambda k: counts[k])
+            extra = len(counts) - 1
+            if extra:
+                return "%s (+%d set%s)" % (best, extra, "s" if extra > 1 else "")
+            return best
 
         def node_at(e):
             item = canvas.find_closest(canvas.canvasx(e.x), canvas.canvasy(e.y))
             for t in canvas.gettags(item):
-                if t.startswith("n_"):
+                if t.startswith("n|"):
                     return t[2:]
             return None
 
@@ -1596,38 +2170,63 @@ class App(tk.Tk):
                 if a not in pos or b not in pos:
                     continue
                 ax, ay = pos[a]; bx, by = pos[b]
-                dash = (4, 3) if kind == "delayed_card" else ()
+                dash = (4, 3) if kind in ("delayed_card", "add_set", "remove_set") else ()
+                color = "#9467bd" if kind in ("add_set", "remove_set") else "#777"
                 lid = canvas.create_line(ax + NW, ay + NH / 2, bx, by + NH / 2,
-                                         arrow="last", fill="#777", dash=dash, tags=("edge",))
+                                         arrow="last", fill=color, dash=dash, tags=("edge",))
                 edge_items[lid] = (a, b)
                 if clabel:
                     mx = (ax + NW + bx) / 2; my = (ay + by) / 2 + NH / 2
-                    txt = clabel if len(clabel) <= 16 else clabel[:15] + "\u2026"
-                    canvas.create_text(mx, my - 7, text=txt, font=("TkDefaultFont", 7),
+                    t = clabel if len(clabel) <= 16 else clabel[:15] + "…"
+                    canvas.create_text(mx, my - 7, text=t, font=("TkDefaultFont", 7),
                                        fill="#3C3489", tags=("edge",))
             canvas.tag_lower("edge")
 
         def add_link(srcid, tgt):
+            if srcid.startswith("set:"):
+                messagebox.showinfo("Link", "Sets can't be link sources — link from a card.")
+                return
             _, c = self.deck.find_card(srcid)
             if not c:
                 return
+            # which effects list?
             if c.get("type") == "decision":
                 keys = sorted(k for k in c if k.startswith("choice_"))
                 ck = self._choose_option(
                     "Attach this link to which choice of '%s'?" % srcid,
-                    [(k, "%s \u2014 %s" % (k.split("_")[-1].upper(), c[k].get("label", ""))) for k in keys])
+                    [(k, "%s — %s" % (k.split("_")[-1].upper(), c[k].get("label", ""))) for k in keys],
+                    parent=win)
                 if not ck:
                     return
                 lst = c[ck].setdefault("effects", [])
             else:
                 lst = c.setdefault("effects", [])
-            for eff in lst:
-                if eff.get("type") == "inject_cards":
-                    if tgt not in eff.setdefault("ids", []):
-                        eff["ids"].append(tgt)
-                    break
+
+            if tgt.startswith("set:"):
+                lst.append({"type": "add_set", "set": tgt[4:], "position": "soon"})
             else:
-                lst.append({"type": "inject_cards", "ids": [tgt], "position": "soon"})
+                kind = self._choose_option(
+                    "How should '%s' bring in '%s'?" % (srcid, tgt),
+                    [("inject", "Inject now (next slot of its type)"),
+                     ("delayed", "Delayed — appears N weeks later")],
+                    parent=win)
+                if not kind:
+                    return
+                if kind == "delayed":
+                    wk = _ask_string(win, "Delay", "After how many weeks?")
+                    try:
+                        n = max(1, int(parse_num(wk)))
+                    except Exception:
+                        n = 1
+                    lst.append({"type": "delayed_card", "id": tgt, "after_days": n, "position": "soon"})
+                else:
+                    for eff in lst:
+                        if eff.get("type") == "inject_cards":
+                            if tgt not in eff.setdefault("ids", []):
+                                eff["ids"].append(tgt)
+                            break
+                    else:
+                        lst.append({"type": "inject_cards", "ids": [tgt], "position": "soon"})
             self._refresh_tree()
             if self.current_id in (srcid, tgt):
                 self._load_card(self.current_id)
@@ -1636,10 +2235,13 @@ class App(tk.Tk):
             _, c = self.deck.find_card(srcid)
             if not c:
                 return
+            set_tgt = tgt[4:] if tgt.startswith("set:") else None
             for _ck, _lbl, lst in card_effect_sources(c):
                 i = 0
                 while i < len(lst):
                     eff = lst[i]; t = eff.get("type")
+                    if set_tgt and t in ("add_set", "remove_set") and eff.get("set") == set_tgt:
+                        lst.pop(i); continue
                     if t in ("inject_cards", "remove_cards") and tgt in eff.get("ids", []):
                         eff["ids"] = [x for x in eff["ids"] if x != tgt]
                         if not eff["ids"]:
@@ -1654,44 +2256,100 @@ class App(tk.Tk):
         def render():
             canvas.delete("all")
             pos.clear()
-            typeof, E = gather()
-            nodes = sorted(set([a for a, _, _, _ in E] + [b for _, b, _, _ in E]))
-            _fp, _fl, _fs, _fw, comps = layout_components(nodes, E)
-            opts = ["All storylines"] + ["pathway %d: %s" % (i + 1, c[0]) for i, c in enumerate(comps)]
+            cards, E, card_set = gather()
+            linked = sorted(set([a for a, _, _, _ in E] + [b for _, b, _, _ in E]))
+            orphans = sorted(set(cards.keys()) - set(linked))
+
+            _fp, _fl, _fs, _fw, comps = layout_components(linked, E)
+            names = []
+            seen_names = {}
+            for c in comps:
+                nm = comp_label(c, card_set)
+                seen_names[nm] = seen_names.get(nm, 0) + 1
+                if seen_names[nm] > 1:
+                    nm = "%s · %s" % (nm, c[0])   # same set twice -> disambiguate by root
+                names.append(nm)
+            opts = (["All storylines"] + names
+                    + (["Unlinked cards"] if orphans else []))
+            shown.update(cards=cards, card_set=card_set, comps=comps,
+                         names=names, orphans=orphans, opts=opts)
             filter_cb["values"] = opts
             sel = filter_var.get()
             if sel not in opts:
                 sel = "All storylines"; filter_var.set(sel)
-            show = set(nodes) if sel == "All storylines" else set(comps[opts.index(sel) - 1])
+
+            if sel == "Unlinked cards":
+                show, show_orphans = set(), orphans
+            elif sel == "All storylines":
+                show, show_orphans = set(linked), orphans
+            else:
+                show, show_orphans = set(comps[opts.index(sel) - 1]), []
+            # pinned cards (pulled in via Find) ride along in any view until
+            # they're linked into it or the filter changes
+            state["pinned"] = {p for p in state["pinned"]
+                               if (p in cards or p.startswith("set:")) and p not in show}
+            show |= state["pinned"]
+            show_orphans = [o for o in show_orphans if o not in show]
             Eshow = [e for e in E if e[0] in show and e[1] in show]
             sub = sorted(show)
             lp, labels, seps, gw, _c = layout_components(sub, Eshow)
             pos.update(lp)
             shown["E"] = Eshow
+            # band headers: the set name(s), not "pathway N"
+            labels = [(ly, comp_label(_c[i], card_set) if i < len(_c) else lt, root)
+                      for i, (ly, lt, root) in enumerate(labels)]
+
+            # orphan band: every card with no links yet, in a compact grid —
+            # this is where new cards live until you wire them in
+            band_top = (max((p[1] for p in pos.values()), default=40) + 130) if pos else 70
+            if show_orphans:
+                labels = list(labels) + [(band_top - 26, "unlinked cards (use Link mode to wire them in)", "")]
+                per_row = 5
+                for i, n in enumerate(show_orphans):
+                    pos[n] = [40 + (i % per_row) * 240, band_top + (i // per_row) * 92]
 
             canvas.create_line(20, 22, 52, 22, fill="#777", arrow="last")
             canvas.create_text(58, 22, text="inject", anchor="w", font=("TkDefaultFont", 8), fill="#444")
             canvas.create_line(118, 22, 150, 22, fill="#777", arrow="last", dash=(4, 3))
             canvas.create_text(156, 22, text="delayed", anchor="w", font=("TkDefaultFont", 8), fill="#444")
+            canvas.create_line(220, 22, 252, 22, fill="#9467bd", arrow="last", dash=(4, 3))
+            canvas.create_text(258, 22, text="add_set", anchor="w", font=("TkDefaultFont", 8), fill="#444")
+            canvas.create_text(330, 22, text="⚡ trigger   🔒 requires", anchor="w",
+                               font=("TkDefaultFont", 8), fill="#444")
+
             for (ly, lt, _root) in labels:
                 canvas.create_text(12, ly, text=lt, anchor="w",
                                    font=("TkDefaultFont", 9, "bold"), fill="#999", tags=("sep",))
             for sy in seps:
                 canvas.create_line(8, sy, gw, sy, fill="#e2e2e2", dash=(2, 4), tags=("sep",))
-            for n in sub:
-                if n not in pos:
-                    continue
+
+            for n in sorted(pos.keys()):
                 x, y = pos[n]
-                tag = "n_" + n
+                tag = "n|" + n
                 hot = (state["src"] == n)
+                if n.startswith("set:"):
+                    canvas.create_rectangle(x, y, x + NW, y + NH, fill="#E4E4E4",
+                                            outline="#d62728" if hot else "#999",
+                                            width=2 if hot else 1, dash=(3, 2), tags=(tag, "node"))
+                    canvas.create_text(x + NW / 2, y + NH / 2, text="SET  " + n[4:], width=NW - 10,
+                                       font=("TkDefaultFont", 8, "bold"), fill="#555", tags=(tag, "node"))
+                    continue
+                c = cards.get(n, {})
+                badges = ("⚡" if c.get("trigger") else "") + ("🔒" if c.get("requires") else "")
                 canvas.create_rectangle(x, y, x + NW, y + NH,
-                                        fill=colors.get(typeof.get(n, ""), "#D3D1C7"),
+                                        fill=colors.get(c.get("type", ""), "#D3D1C7"),
                                         outline="#d62728" if hot else "#555", width=2 if hot else 1,
                                         tags=(tag, "node"))
                 canvas.create_text(x + NW / 2, y + NH / 2 - 7, text=n, width=NW - 10,
                                    font=("TkDefaultFont", 8), fill="#1a1a1a", tags=(tag, "node"))
-                canvas.create_text(x + NW / 2, y + NH / 2 + 11, text=typeof.get(n, ""),
+                sub_label = c.get("type", "")
+                if c.get("trigger"):
+                    sub_label += "  ⚡" + str(c["trigger"].get("event", ""))
+                canvas.create_text(x + NW / 2, y + NH / 2 + 11, text=sub_label,
                                    font=("TkDefaultFont", 7), fill="#555", tags=(tag,))
+                if badges:
+                    canvas.create_text(x + NW - 4, y + 8, text=badges, anchor="e",
+                                       font=("TkDefaultFont", 8), tags=(tag,))
             redraw_edges()
             canvas.tag_lower("sep")
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -1702,8 +2360,11 @@ class App(tk.Tk):
                 if not n:
                     return
                 if state["src"] is None:
+                    if n.startswith("set:"):
+                        status_var.set("Sets can't be sources — click a card first.")
+                        return
                     state["src"] = n
-                    status_var.set("source: %s \u2014 now click the target card" % n)
+                    status_var.set("source: %s — now click the target (card or set)" % n)
                     render()
                 else:
                     if n != state["src"]:
@@ -1720,7 +2381,7 @@ class App(tk.Tk):
                 return
             cx, cy = canvas.canvasx(e.x), canvas.canvasy(e.y)
             dx, dy = cx - drag["x"], cy - drag["y"]
-            canvas.move("n_" + drag["n"], dx, dy)
+            canvas.move("n|" + drag["n"], dx, dy)
             pos[drag["n"]][0] += dx; pos[drag["n"]][1] += dy
             drag["x"], drag["y"] = cx, cy
             redraw_edges()
@@ -1729,33 +2390,138 @@ class App(tk.Tk):
             if link_mode.get():
                 return
             n = node_at(e)
-            if n:
-                self._commit_current()
+            if not n:
+                return
+            if n.startswith("set:"):
                 try:
-                    self.tree.selection_set("card:" + n); self.tree.see("card:" + n)
+                    self.tree.selection_set("set:" + n[4:]); self.tree.see("set:" + n[4:])
                 except Exception:
                     pass
-                self._load_card(n)
-                self.lift()
+                return
+            self._commit_current()
+            try:
+                self.tree.selection_set("card:" + n); self.tree.see("card:" + n)
+            except Exception:
+                pass
+            self._load_card(n)
+            self.lift()
+
+        def focus_node(n, flash=True):
+            """Scroll the canvas so node n is in view, with a brief highlight."""
+            if n not in pos:
+                return
+            x, y = pos[n]
+            bbox = canvas.bbox("all") or (0, 0, 1, 1)
+            w = max(1, bbox[2] - bbox[0]); h = max(1, bbox[3] - bbox[1])
+            canvas.xview_moveto(max(0.0, (x - 320 - bbox[0]) / w))
+            canvas.yview_moveto(max(0.0, (y - 220 - bbox[1]) / h))
+            if flash:
+                ring = canvas.create_rectangle(x - 6, y - 6, x + NW + 6, y + NH + 6,
+                                               outline="#d62728", width=3)
+                canvas.after(1500, lambda: canvas.delete(ring))
+
+        def refocus(_e=None):
+            win.lift()
+            win.focus_force()
+
+        def find_card(_e=None):
+            """Search ANY card in the deck — the graph window keeps focus.
+            The picked card is PULLED INTO the current view (pinned) so you
+            can link it right here; in Link mode it sets source / completes
+            the link directly. Your pathway filter never changes."""
+            ids = list(shown["cards"].keys()) + ["set:" + s for s in self.deck.set_ids()]
+            pick = SearchPicker(self, "Find card", ids, parent=win).result
+            refocus()
+            if not pick:
+                return
+            if link_mode.get():
+                if state["src"] is None:
+                    if pick.startswith("set:"):
+                        status_var.set("Sets can't be sources — pick a card.")
+                        return
+                    state["src"] = pick
+                    state["pinned"].add(pick)
+                    status_var.set("source: %s — now click a target, or Find again" % pick)
+                    render()
+                    focus_node(pick)
+                else:
+                    if pick != state["src"]:
+                        add_link(state["src"], pick)
+                    state["src"] = None
+                    status_var.set("Link mode: click a source card, then its target.")
+                    render()
+                return
+            # pull the card into THIS view so it can be wired in right here
+            state["pinned"].add(pick)
+            render()
+            focus_node(pick)
+            status_var.set("'%s' pinned into view — right-click it to link; changing filter unpins." % pick)
+
+        def link_via_search(srcid):
+            ids = [i for i in shown["cards"].keys() if i != srcid]
+            ids += ["set:" + s for s in self.deck.set_ids()]
+            pick = SearchPicker(self, "Link '%s' to…" % srcid, ids, parent=win).result
+            refocus()
+            if pick:
+                add_link(srcid, pick)
+                render()
+                focus_node(pick, flash=True)
 
         def on_right(e):
+            n = node_at(e)
+            if n and not n.startswith("set:"):
+                menu = tk.Menu(win, tearoff=0)
+                menu.add_command(label="Link to… (search)", command=lambda: link_via_search(n))
+                menu.add_command(label="Edit card", command=lambda: on_double_node(n))
+                menu.tk_popup(e.x_root, e.y_root)
+                return
             item = canvas.find_closest(canvas.canvasx(e.x), canvas.canvasy(e.y))
             if item and item[0] in edge_items:
                 s, t = edge_items[item[0]]
-                if messagebox.askyesno("Delete link", "Remove link  %s \u2192 %s ?" % (s, t)):
+                if messagebox.askyesno("Delete link", "Remove link  %s → %s ?" % (s, t)):
                     del_link(s, t); render()
 
+        def on_double_node(n):
+            self._commit_current()
+            try:
+                self.tree.selection_set("card:" + n); self.tree.see("card:" + n)
+            except Exception:
+                pass
+            self._load_card(n)
+            self.lift()
+
+        def filter_keytype(_e=None):
+            """Type in the pathway box to filter its dropdown live."""
+            q = filter_var.get().strip().lower()
+            opts = shown["opts"]
+            matches = [o for o in opts if q in o.lower()] if q else opts
+            filter_cb["values"] = matches or opts
+
+        def filter_enter(_e=None):
+            q = filter_var.get().strip().lower()
+            opts = shown["opts"]
+            matches = [o for o in opts if q in o.lower()]
+            if matches:
+                filter_var.set(matches[0])
+            render()
+
+        find_btn.configure(command=find_card)
+        win.bind("<Control-f>", find_card)
         canvas.bind("<Button-1>", on_press)
         canvas.bind("<B1-Motion>", on_motion)
         canvas.bind("<Double-Button-1>", on_double)
         canvas.bind("<Button-3>", on_right)
-        filter_cb.bind("<<ComboboxSelected>>", lambda e: render())
+        filter_cb.bind("<<ComboboxSelected>>",
+                       lambda e: (state["pinned"].clear(), render()))
+        filter_cb.bind("<KeyRelease>", filter_keytype)
+        filter_cb.bind("<Return>",
+                       lambda e: (state["pinned"].clear(), filter_enter()))
         render()
 
-    def _choose_option(self, prompt, options):
+    def _choose_option(self, prompt, options, parent=None):
         if not options:
             return None
-        dlg = ModalDialog(self, "Choose")
+        dlg = ModalDialog(self, "Choose", parent=parent)
         ttk.Label(dlg.body, text=prompt, wraplength=360).pack(anchor="w", pady=(0, 6))
         var = tk.StringVar(value=options[0][0])
         for val, lbl in options:
@@ -1783,7 +2549,8 @@ class App(tk.Tk):
                 links = cards + [f"set:{x}" for x in sets_]
                 if links:
                     arrow = "  ──▶  " + ", ".join(links)
-                txt.insert("end", f"   {c.get('id')} [{c.get('type','?')}]{arrow}\n")
+                badges = self._card_badges(c)
+                txt.insert("end", f"   {badges}{c.get('id')} [{c.get('type','?')}]{arrow}\n")
             txt.insert("end", "\n")
         txt.config(state="disabled")
 
@@ -1811,8 +2578,8 @@ def _ask_string(parent, title, prompt):
     def ok():
         dlg.result = var.get().strip()
         dlg.destroy()
-    dlg._ok = ok
     ent.bind("<Return>", lambda e: ok())
+    dlg._ok = ok
     dlg.add_buttons()
     return dlg.wait()
 
